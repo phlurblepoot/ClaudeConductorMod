@@ -1,0 +1,860 @@
+import type { On } from 'claude-code'
+import { describe, expect, mock, test } from 'claude-code/testing'
+import type { Engine, Mounted } from 'claude-code/testing'
+
+import { marksOf, svgBar, textBar } from '../hooks/bar'
+import { cleanTree, uniqueKeys } from '../hooks/draw'
+import { getSection, parseVerdict, recordResult, renderBrief, setSection } from '../hooks/briefs'
+import { extractDecisions, extractKnowledge, extractNeeds, extractQuestions, extractStatus, stripKnowledge } from '../hooks/notes'
+import {
+  PLAN_TEMPLATE,
+  extractPlanItem,
+  parsePlan,
+  parseTags,
+  phasesOf,
+  planMarks,
+  planSignature,
+  readyItems,
+  setItemState,
+  setItemTag,
+} from '../hooks/plan'
+import { costOf, learnedTier, nextTier, recordOutcome, routeTask } from '../hooks/route'
+import { spillNote, textOfResult } from '../hooks/spill'
+import { fromProgress, fromTodos, settleTasks, taskCreated, taskUpdated } from '../hooks/tasks'
+
+const OPTIONS = { options: { showPane: false, classifier: false, sound: false } }
+
+const NO_TAGS = { agent: null, model: null, effort: null, after: [], files: [], verify: null }
+
+/** An in-memory file system beneath the plugin, so its file work runs in a test. */
+function memFs(on: On, files: Record<string, string>) {
+  // The engine hands paths over in the platform's form (C:\proj\...): compare them as /proj/...
+  const norm = (p: string) => p.replace(/\\/g, '/').replace(/^[A-Za-z]:/, '')
+  let clock = 1
+  const mtimes: Record<string, number> = {}
+  on('fs.read', (_, e) => (norm(e.path) in files ? { value: files[norm(e.path)]! } : { deny: `ENOENT ${e.path}` }))
+  on('fs.write', (_, e) => {
+    files[norm(e.path)] = e.text
+    mtimes[norm(e.path)] = ++clock
+    return { value: undefined }
+  })
+  on('fs.exists', (_, e) => ({ value: norm(e.path) in files || Object.keys(files).some(k => k.startsWith(`${norm(e.path)}/`)) }))
+  on('fs.stat', (_, e) =>
+    norm(e.path) in files
+      ? { value: { kind: 'file' as const, size: files[norm(e.path)]!.length, mtimeMs: mtimes[norm(e.path)] ?? 1, isLink: false } }
+      : { deny: `ENOENT ${e.path}` },
+  )
+  on('fs.list', () => ({ value: [] }))
+}
+
+describe('router', () => {
+  test('lookups and summaries go to Haiku', () => {
+    expect(routeTask('Find where the auth token is read and list the files that use it', 'general-purpose', 'opus').tier).toBe('haiku')
+    expect(routeTask('Summarize what src/payments does', 'claude', 'opus').tier).toBe('haiku')
+  })
+
+  test('ordinary implementation goes to Sonnet', () => {
+    expect(routeTask('Implement a POST endpoint for creating invoices in src/api/invoices.ts and add unit tests', 'general-purpose', 'opus').tier).toBe('sonnet')
+  })
+
+  test('hard reasoning goes to the top model, never above it', () => {
+    const hard =
+      'Investigate why the websocket reconnect is flaky: find the root cause of the race condition in the concurrent retry loop and design a fix'
+    expect(routeTask(hard, 'general-purpose', 'opus').tier).toBe('opus')
+    expect(routeTask(hard, 'general-purpose', 'fable').tier).toBe('fable')
+    expect(routeTask(hard, 'general-purpose', 'sonnet').tier).toBe('sonnet')
+  })
+
+  test('agent types decide where the text cannot', () => {
+    expect(routeTask('anything at all', 'Explore', 'opus').tier).toBe('haiku')
+    expect(routeTask('anything at all', 'conductor:scout', 'opus').tier).toBe('haiku')
+    expect(routeTask('anything at all', 'Plan', 'opus').tier).toBe('opus')
+    expect(routeTask('anything at all', 'conductor:curator', 'opus').tier).toBe('haiku')
+  })
+
+  test('escalation climbs one tier at a time, up to the top model', () => {
+    expect(nextTier('haiku', 'opus')).toBe('sonnet')
+    expect(nextTier('sonnet', 'opus')).toBe('opus')
+    expect(nextTier('opus', 'opus')).toBe(null)
+    expect(nextTier('sonnet', 'sonnet')).toBe(null)
+  })
+
+  test('a kind of task that keeps failing on a tier is routed one up', () => {
+    let stats = {}
+    for (let i = 0; i < 3; i++) stats = recordOutcome(stats, 'builder:mechanical change', 'haiku', false)
+    expect(learnedTier('haiku', 'builder:mechanical change', stats, 'opus')).toBe('haiku')
+    stats = recordOutcome(stats, 'builder:mechanical change', 'haiku', true)
+    stats = recordOutcome(stats, 'builder:mechanical change', 'haiku', false)
+    expect(learnedTier('haiku', 'builder:mechanical change', stats, 'opus')).toBe('sonnet')
+  })
+
+  test('costs follow the price table', () => {
+    const u = { input_tokens: 1_000_000, output_tokens: 100_000, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+    expect(costOf('haiku', u)).toBe(1.5)
+    expect(costOf('opus', u)).toBe(6)
+  })
+})
+
+describe('plan', () => {
+  const PLAN = [
+    '# Plan: Ship the invoicing app',
+    '',
+    '## Phase 1: Foundations',
+    '- [x] T1: Scaffold the project',
+    '- [x] T2: Database schema',
+    '',
+    '## Phase 2: Invoices',
+    '- [~] T3: Create-invoice endpoint {agent: builder, model: sonnet, after: T2, files: src/api.ts, src/db.ts, verify: npm test api}',
+    '- [ ] T4: Invoice PDF export {model: haiku, after: T3}',
+    '- [!] T5: Stripe webhooks',
+    '  blocked: waiting for API keys',
+  ].join('\n')
+
+  test('counts tasks by state, reads their tags, and finds the open phase', () => {
+    const plan = parsePlan(PLAN, 7)!
+    expect(plan.total).toBe(5)
+    expect([plan.done, plan.doing, plan.blocked]).toEqual([2, 1, 1])
+    expect(plan.phase).toBe('Phase 2: Invoices')
+    expect(plan.current).toEqual(['T3: Create-invoice endpoint'])
+    expect(plan.items[2]).toEqual({
+      id: 'T3',
+      text: 'Create-invoice endpoint',
+      state: 'doing',
+      phase: 'Phase 2: Invoices',
+      agent: 'builder',
+      model: 'sonnet',
+      effort: null,
+      after: ['T2'],
+      files: ['src/api.ts', 'src/db.ts'],
+      verify: 'npm test api',
+    })
+    expect(plan.items[4]).toEqual({ id: 'T5', text: 'Stripe webhooks', state: 'blocked', phase: 'Phase 2: Invoices', ...NO_TAGS })
+  })
+
+  test("the template's example tasks inside its comment are not a plan", () => {
+    expect(parsePlan(PLAN_TEMPLATE)).toBe(null)
+    expect(setItemState(PLAN_TEMPLATE, 'T1', 'done').isMatched).toBe(false)
+  })
+
+  test('tags with commas inside a value', () => {
+    expect(parseTags('agent: scout, after: T1, T2, files: a.ts, b.ts, verify: npm test, then lint')).toEqual({
+      ...NO_TAGS,
+      agent: 'scout',
+      after: ['T1', 'T2'],
+      files: ['a.ts', 'b.ts'],
+      verify: 'npm test, then lint',
+    })
+  })
+
+  test('a task is ready once every task it comes after is done', () => {
+    const items = parsePlan(PLAN)!.items
+    expect(readyItems(items, new Set()).map(i => i.id)).toEqual([])
+    const t3done = parsePlan(setItemState(PLAN, 'T3', 'done').text)!.items
+    expect(readyItems(t3done, new Set()).map(i => i.id)).toEqual(['T4'])
+    expect(readyItems(t3done, new Set(['T4'])).map(i => i.id)).toEqual([])
+  })
+
+  test('the pickers rewrite a task tag, and approval ignores checkbox ticks', () => {
+    expect(setItemTag(PLAN, 'T4', 'model', 'sonnet').text).toContain('- [ ] T4: Invoice PDF export {model: sonnet, after: T3}')
+    expect(setItemTag(PLAN, 'T5', 'agent', 'scout').text).toContain('- [!] T5: Stripe webhooks {agent: scout}')
+    const sig = planSignature(parsePlan(PLAN)!.items)
+    expect(planSignature(parsePlan(setItemState(PLAN, 'T4', 'done').text)!.items)).toBe(sig)
+    expect(planSignature(parsePlan(`${PLAN}\n- [ ] T6: New task`)!.items)).not.toBe(sig)
+  })
+
+  test('ticks an item by id or text, and never reopens a done one', () => {
+    expect(setItemState(PLAN, 'T4', 'done').text).toContain('- [x] T4: Invoice PDF export')
+    expect(setItemState(PLAN, 'T1', 'doing').text).toContain('- [x] T1: Scaffold the project')
+    expect(setItemState(PLAN, 'invoice pdf export', 'doing').text).toContain('- [~] T4: Invoice PDF export')
+  })
+
+  test('dotted ids; a done task stays done unless forced; tasks for the person or the main agent never run', () => {
+    const text = [
+      '# Plan: Rig',
+      '## Phase 1',
+      '- [x] T29.2: Base mesh',
+      '- [ ] T29.2.1: Rig the face {after: T29.2}',
+      '- [ ] T29.2.2: Approve the look {agent: main, after: T29.2.1}',
+      '- [ ] T30: Ship {after: T29.2.2}',
+    ].join('\n')
+    const items = parsePlan(text)!.items
+    expect(items.map(i => i.id)).toEqual(['T29.2', 'T29.2.1', 'T29.2.2', 'T30'])
+    expect(items[3]!.after).toEqual(['T29.2.2'])
+    expect(readyItems(items, new Set()).map(i => i.id)).toEqual(['T29.2.1'])
+    const rigged = setItemState(text, 'T29.2.1', 'done').text
+    expect(rigged).toContain('- [x] T29.2.1: Rig the face')
+    expect(rigged).toContain('- [x] T29.2: Base mesh')
+    expect(readyItems(parsePlan(rigged)!.items, new Set()).map(i => i.id)).toEqual([])
+    expect(setItemState(text, 'T29.2', 'todo').text).toContain('- [x] T29.2: Base mesh')
+    expect(setItemState(text, 'T29.2', 'blocked').text).toContain('- [x] T29.2: Base mesh')
+    expect(setItemState(text, 'T29.2', 'todo', true).text).toContain('- [ ] T29.2: Base mesh')
+  })
+
+  test('groups tasks by phase; dots per task while they fit, else per phase', () => {
+    const items = parsePlan(PLAN)!.items
+    expect(phasesOf(items).map(p => [p.name, p.done, p.total, p.state])).toEqual([
+      ['Phase 1: Foundations', 2, 2, 'done'],
+      ['Phase 2: Invoices', 0, 3, 'doing'],
+    ])
+    expect(planMarks(items, 20).map(m => m.state)).toEqual(['done', 'done', 'doing', 'todo', 'blocked'])
+    expect(planMarks(items, 8)).toEqual([
+      { at: 0.4, state: 'done' },
+      { at: 1, state: 'doing' },
+    ])
+  })
+
+  test('reads the Plan item line of a task prompt', () => {
+    expect(extractPlanItem('Build the export.\nPlan item: T4 (PDF export)\nFiles: src/pdf.ts')).toBe('T4')
+    expect(extractPlanItem('**Plan item:** T12')).toBe('T12')
+    expect(extractPlanItem('Plan item: none')).toBe('NONE')
+    expect(extractPlanItem('No plan here')).toBe(null)
+  })
+})
+
+describe('briefs', () => {
+  test('a brief carries the goal, files, done-criteria and the inputs it depends on', () => {
+    const item = { id: 'T4', text: 'PDF export', state: 'todo' as const, phase: 'Phase 2', ...NO_TAGS, files: ['src/pdf.ts'], verify: 'npm test pdf' }
+    const doc = renderBrief(item, 'Invoicing', [{ id: 'T3', text: 'Endpoint', state: 'done', result: 'Added POST /invoices.' }], '- 2026-10-12: use pdfkit')
+    expect(doc).toContain('# T4: PDF export')
+    expect(doc).toContain('- src/pdf.ts')
+    expect(doc).toContain('`npm test pdf` passes')
+    expect(getSection(doc, 'Inputs from earlier tasks')).toContain('Added POST /invoices.')
+    expect(getSection(doc, 'Decisions that apply')).toBe('- 2026-10-12: use pdfkit')
+  })
+
+  test('results replace each other; earlier attempts are kept', () => {
+    let doc = '# T1: x\n\n## Notes\nnone\n'
+    doc = recordResult(doc, { at: 'a', model: 'haiku', status: 'blocked', attempt: 1, summary: 'first' })
+    doc = recordResult(doc, { at: 'b', model: 'sonnet', status: 'done', attempt: 2, summary: 'second' })
+    expect(getSection(doc, 'Result')).toContain('second')
+    expect(getSection(doc, 'Earlier attempts')).toContain('first')
+    expect(getSection(setSection(doc, 'Notes', 'more'), 'Notes')).toBe('more')
+  })
+})
+
+describe('task lists', () => {
+  test('a declared step list ticks as done climbs', () => {
+    const first = fromProgress([], null, { done: 0, total: null, step: '', steps: ['Read code', 'Write fix', 'Run tests'] })
+    expect(first.source).toBe('steps')
+    expect(first.tasks.map(t => t.state)).toEqual(['doing', 'todo', 'todo'])
+    expect(fromProgress(first.tasks, first.source, { done: 2, total: null, step: '', steps: null }).tasks.map(t => t.state)).toEqual(['done', 'done', 'doing'])
+  })
+
+  test('steps reported one at a time build a history', () => {
+    const a = fromProgress([], null, { done: 0, total: 4, step: 'Survey', steps: null })
+    const b = fromProgress(a.tasks, a.source, { done: 1, total: 4, step: 'Patch', steps: null })
+    expect(b.tasks).toEqual([
+      { id: null, text: 'Survey', state: 'done' },
+      { id: null, text: 'Patch', state: 'doing' },
+    ])
+  })
+
+  test('TodoWrite and TaskCreate/TaskUpdate lists', () => {
+    expect(fromTodos([{ content: 'A', status: 'completed' }, { content: 'B', status: 'in_progress' }]).map(t => t.state)).toEqual(['done', 'doing'])
+    const moved = taskUpdated(taskCreated(taskCreated([], '1', 'Write docs'), '2', 'Ship'), { taskId: '1', status: 'completed' })
+    expect(moved.map(t => [t.text, t.state])).toEqual([
+      ['Write docs', 'done'],
+      ['Ship', 'todo'],
+    ])
+    expect(taskUpdated(moved, { taskId: '2', status: 'deleted' }).length).toBe(1)
+  })
+
+  test('a finished agent ticks its list; a blocked one marks where it stopped', () => {
+    const list = fromProgress([], null, { done: 1, total: null, step: '', steps: ['a', 'b', 'c'] }).tasks
+    expect(settleTasks(list, 'done').every(t => t.state === 'done')).toBe(true)
+    expect(settleTasks(list, 'blocked').map(t => t.state)).toEqual(['done', 'blocked', 'todo'])
+  })
+})
+
+describe('bars', () => {
+  test('a drawing never repeats a key, and its text holds no control characters', () => {
+    const row = (key: string, label: string) => ({ type: 'Button', key, props: { key, label } })
+    const tree = { type: 'Box', props: {}, children: [row('la-l-a1-0', 'one'), row('la-l-a1-0', 'two\u001b[31m'), { type: 'Box', key: 'x', props: { key: 'x' }, children: [row('la-l-a1-0', 'three')] }] }
+    const drawn = uniqueKeys(cleanTree(tree))
+    expect(drawn.children.map(c => c.key)).toEqual(['la-l-a1-0', 'la-l-a1-0~2', 'x'])
+    expect((drawn.children[2] as { children: Array<{ key: string; props: { key: string } }> }).children[0]!.props.key).toBe('la-l-a1-0~3')
+    expect((drawn.children[1] as { props: { label: string } }).props.label).toBe('two')
+    expect(tree.children[1]!.key).toBe('la-l-a1-0')
+  })
+
+  test('the text bar fills, keeps its width and draws a dot per checkpoint', () => {
+    const marks = marksOf([
+      { weight: 1, state: 'done' },
+      { weight: 1, state: 'doing' },
+      { weight: 1, state: 'todo' },
+    ])
+    const spans = textBar(0.55, 12, marks)
+    expect(spans.map(s => s.text).join('')).toBe('━━━●━━╸◉───○')
+    expect(spans.find(s => s.text === '◉')?.tone).toBe('doing')
+  })
+
+  test('too many checkpoints for the width: the bar alone', () => {
+    const marks = marksOf(Array.from({ length: 10 }, () => ({ weight: 1, state: 'todo' as const })))
+    expect(textBar(0, 10, marks).map(s => s.text).join('')).toBe('──────────')
+  })
+
+  test('the SVG bar draws a dot per checkpoint', () => {
+    const svg = svgBar(0.4, 300, marksOf([{ weight: 1, state: 'done' }, { weight: 1, state: 'todo' }]), '#3FB950')
+    expect(svg.startsWith('<svg')).toBe(true)
+    expect(svg.match(/<circle/g)?.length).toBe(2)
+  })
+})
+
+describe('reports', () => {
+  const REPORT =
+    'STATUS: done\nAdded the endpoint.\n<decisions>\n- Used zod for validation (it was already a dependency)\n</decisions>\n<knowledge>\n- Invoices live in src/api/invoices.ts (src: src/api/invoices.ts)\n</knowledge>'
+
+  test('pulls the status, decisions, notes, questions and verdicts', () => {
+    expect(extractStatus(REPORT)).toBe('done')
+    expect(extractDecisions(REPORT)).toEqual(['Used zod for validation (it was already a dependency)'])
+    expect(extractKnowledge(REPORT)).toBe('- Invoices live in src/api/invoices.ts (src: src/api/invoices.ts)')
+    expect(extractNeeds('STATUS: blocked\nNEEDS: Which database?\nOPTIONS: sqlite | postgres')).toEqual({ question: 'Which database?', options: ['sqlite', 'postgres'] })
+    expect(extractNeeds(REPORT)).toBe(null)
+    expect(extractQuestions('<questions>\n- Which date format? → ISO 8601\n- Tabs or spaces?\n</questions>')).toEqual([
+      { question: 'Which date format?', assumed: 'ISO 8601' },
+      { question: 'Tabs or spaces?', assumed: '' },
+    ])
+    expect(parseVerdict('VERDICT: fail\nThe test for totals fails.')).toEqual({ isPass: false, detail: 'The test for totals fails.' })
+  })
+
+  test('strips the notes the inbox already holds', () => {
+    expect(stripKnowledge('STATUS: done\nok\n<knowledge>\n- x\n</knowledge>', '.knowledge/inbox.md')).toBe('STATUS: done\nok\n[notes saved to .knowledge/inbox.md]')
+  })
+
+  test('a spilled output keeps its head, its tail and a pointer', () => {
+    const big = `${'a'.repeat(3000)}MIDDLE${'z'.repeat(3000)}`
+    const note = spillNote('.knowledge/session/spill/bash-1.txt', big)
+    expect(note).toContain('.knowledge/session/spill/bash-1.txt')
+    expect(note).not.toContain('MIDDLE')
+    expect(textOfResult([{ type: 'text', text: 'hi' }, { type: 'image' }])).toEqual({ text: 'hi', hasMedia: true })
+  })
+})
+
+const SPAWN = { provider: { plugin: 'engine', tier: 'core' }, parentModel: 'claude-opus-5-5', background: true, fork: false } as const
+const PANE = { title: 'Agents', isFocused: false, bodyColumns: 60, placement: 'dock', scroll: { offset: 0, bodyRows: 60 }, view: {} } as const
+
+describe('hooks', () => {
+  test('a spawn with no model gets the cheapest that fits; a named model stands', OPTIONS, async ($, on) => {
+    mock.clock(on, { now: 1000 })
+    on('session.root', () => ({ value: '/proj' }))
+    const asked: Array<string | undefined> = []
+    on('agent.spawn', (_, e) => {
+      asked.push(e.model)
+      return { model: e.model ?? 'claude-sonnet-5-5', agentId: `agent-${asked.length}` }
+    })
+    await $.agent.spawn({ ...SPAWN, tool_use_id: 't1', subagentType: 'general-purpose', description: 'find config', prompt: 'Find where the config file is loaded and list the files' })
+    await $.agent.spawn({ ...SPAWN, tool_use_id: 't2', subagentType: 'general-purpose', description: 'pin it', prompt: 'Implement the retry\nPlan item: none', model: 'opus' })
+    expect(asked).toEqual(['haiku', 'opus'])
+  })
+
+  test('the plan-first gate refuses a builder task that names no plan task', OPTIONS, async ($, on) => {
+    on('session.root', () => ({ value: '/proj' }))
+    on('agent.spawn', () => ({ model: 'claude-sonnet-5-5', agentId: 'agent-1' }))
+    const refused = await $.agent.spawn({ ...SPAWN, tool_use_id: 't1', subagentType: 'conductor:builder', description: 'x', prompt: 'Implement the export' })
+    expect(refused.deny).toContain('Plan item')
+    const allowed = await $.agent.spawn({ ...SPAWN, tool_use_id: 't2', subagentType: 'conductor:builder', description: 'x', prompt: 'Implement the export\nPlan item: none' })
+    expect(allowed.agentId).toBe('agent-1')
+  })
+
+  test('the pane lists running agents and the bar counts them, on every surface', OPTIONS, async ($, on) => {
+    mock.clock(on, { now: 1000 })
+    on('session.root', () => ({ value: '/proj' }))
+    on('agent.spawn', (_, e) => ({ model: e.model ?? 'claude-sonnet-5-5', agentId: 'agent-1' }))
+    on('ui.render', (engine, e) => engine.ui.resolve(e).Box({}))
+    await $.agent.spawn({ ...SPAWN, tool_use_id: 't1', subagentType: 'conductor:builder', description: 'Add invoice export', prompt: 'Implement the PDF export\nPlan item: none' })
+
+    for (const surface of ['terminal', 'desktop'] as const) {
+      const pane = await $.ui.mount({ plugin: 'conductor', surface, component: 'Pane', requestId: 'conductor-agents', props: PANE })
+      expect(await pane.find({ type: 'Button', text: /Add invoice export/ })).toBeDefined()
+      expect(await pane.find({ type: 'Text', text: /Running \(1\)/ })).toBeDefined()
+      await pane.unmount()
+
+      const band = await $.ui.mount({
+        plugin: 'conductor',
+        surface,
+        component: 'AbovePrompt',
+        props: { hasSurvey: false, isWorking: true, maxRows: 10, bodyColumns: 100, scroll: { offset: 0, bodyRows: 9 }, view: {} },
+      })
+      expect(await band.find({ type: 'Text', text: /1 agent working/ })).toBeDefined()
+      await band.unmount()
+    }
+  })
+
+  test('agent and main task lists expand in the pane, on every surface', OPTIONS, async ($, on) => {
+    mock.clock(on, { now: 1000 })
+    on('session.root', () => ({ value: '/proj' }))
+    on('agent.spawn', (_, e) => ({ model: e.model ?? 'claude-sonnet-5-5', agentId: 'agent-1' }))
+    on('tool.call', () => ({ result: 'ok' }))
+    await $.agent.spawn({ ...SPAWN, tool_use_id: 't1', subagentType: 'conductor:builder', description: 'Add invoice export', prompt: 'Implement the PDF export\nPlan item: none' })
+    await $.tool.call({ tool: 'mcp__conductor__progress', agentId: 'agent-1', done: 1, steps: ['Read the code', 'Render the PDF', 'Run the tests'] } as never)
+    await $.tool.call({ tool: 'TodoWrite', todos: [{ content: 'Review the export', status: 'pending', activeForm: 'Reviewing' }] })
+
+    for (const surface of ['terminal', 'desktop'] as const) {
+      const pane = await $.ui.mount({ plugin: 'conductor', surface, component: 'Pane', requestId: 'conductor-agents', props: PANE })
+      expect(await pane.find({ type: 'Text', text: 'Review the export' })).toBeDefined()
+      expect(await pane.find({ type: 'Text', text: 'Read the code' })).toBeUndefined()
+      await pane.press({ key: 'tg-agent-1' })
+      expect(await pane.find({ type: 'Text', text: 'Read the code' })).toBeDefined()
+      expect(await pane.find({ type: 'Text', text: '1/3' })).toBeDefined()
+      await pane.press({ key: 'tg-agent-1' })
+      await pane.unmount()
+    }
+  })
+
+  test("the mod approves only its own launches: the model's agent calls keep the session's permission decision", OPTIONS, async ($, on) => {
+    on('tool.check', () => ({ decision: 'ask' as const, reason: 'the mode decides' }))
+    const fromModel = await $.tool.check({ tool: 'Agent', input: { subagent_type: 'conductor:builder', description: 'x', prompt: 'y' } })
+    expect(fromModel.decision).toBe('ask')
+    const stop = await $.tool.check({ tool: 'TaskStop', input: { task_id: 'someone-else' } })
+    expect(stop.decision).toBe('ask')
+  })
+
+  test('/conductor test launches one tiny agent and reports whether it started', OPTIONS, async ($, on) => {
+    const clock = mock.clock(on, { now: 1000 })
+    on('session.root', () => ({ value: '/proj' }))
+    const asked: string[] = []
+    on('agent.spawn', (_, e) => {
+      asked.push(`${e.subagentType}:${e.model}`)
+      return { model: 'claude-haiku-4-5', agentId: 'probe-1' }
+    })
+    on('agent.list', () => ({ value: [{ id: 'probe-1', description: 'conductor self-test', type: 'conductor:scout', status: 'running' }] }))
+    const running = $.command.run({ command: 'conductor', args: 'test' } as never)
+    await clock.advance(100)
+    const ok = await running
+    expect(ok.text).toContain('Self-test passed')
+    // (The test kit drops agent types no session.start registered, so only the model is checked.)
+    expect(asked.map(x => x.split(':').pop())).toEqual(['haiku'])
+  })
+
+  test('an agent resumed after it was stopped shows as running again, and its report is still read', OPTIONS, async ($, on) => {
+    const clock = mock.clock(on, { now: 1_000_000 })
+    on('session.root', () => ({ value: '/proj' }))
+    on('agent.spawn', (_, e) => ({ model: e.model ?? 'claude-sonnet-5-5', agentId: 'agent-1' }))
+    on('agent.list', () => ({ value: [{ id: 'ghost-1', description: 'Started elsewhere', type: 'general-purpose', status: 'running' }] }))
+    on('turn.complete', (_, e) => ({ text: e.answer }))
+    on('tool.call', () => ({ result: 'ok' }))
+    const end = (agentId: string, reason: 'answer' | 'aborted', answer: string) =>
+      $.turn.complete({ turnId: `t-${agentId}`, agentId, answer, reason, durationMs: 1000, isAborted: reason === 'aborted' })
+    const pane = async (check: (ui: Mounted<'terminal', 'Pane'>) => Promise<void>) => {
+      const ui = await $.ui.mount({ plugin: 'conductor', surface: 'terminal', component: 'Pane', requestId: 'conductor-agents', props: PANE })
+      await check(ui)
+      await ui.unmount()
+    }
+
+    await $.agent.spawn({ ...SPAWN, tool_use_id: 't1', subagentType: 'conductor:builder', description: 'Long job', prompt: 'Implement it\nPlan item: none' })
+    await end('agent-1', 'aborted', '')
+    await pane(async ui => expect(await ui.find({ type: 'Text', text: /Running \(0\)/ })).toBeDefined())
+
+    // Resumed with SendMessage: no spawn fires, but its first call shows it is running again.
+    await clock.advance(30_000)
+    await $.tool.call({ tool: 'mcp__conductor__progress', agentId: 'agent-1', done: 0, steps: ['Pick up where I stopped'] } as never)
+    await pane(async ui => {
+      expect(await ui.find({ type: 'Text', text: /Running \(1\)/ })).toBeDefined()
+      expect(await ui.find({ type: 'Text', text: /Pick up where I stopped/ })).toBeDefined()
+    })
+
+    // Its report when it finishes again is read, not dropped.
+    await end('agent-1', 'answer', 'STATUS: done\nFinished the job.\n<knowledge>none</knowledge>')
+    await pane(async ui => expect(await ui.find({ type: 'Text', text: /Running \(0\)/ })).toBeDefined())
+
+    // An agent the mod never saw start is picked up by its first call, from the session's agent list.
+    await $.tool.call({ tool: 'Read', file_path: '/proj/a.ts', agentId: 'ghost-1' } as never)
+    await pane(async ui => expect(await ui.find({ type: 'Button', text: /Started elsewhere/ })).toBeDefined())
+  })
+
+  describe('launching in auto mode', () => {
+    const NO_VERDICT =
+      'The server-side auto mode classifier gave no verdict for Agent: the request that produced this action did not ask for one. Issue the action again once, as-is.'
+
+    /** A project with a one-task plan, a spawn that answers by \`decide\`, and the engine's turn events answered. */
+    function world(on: On, decide: (n: number) => 'refuse' | 'deny' | 'start') {
+      on('session.root', () => ({ value: '/proj' }))
+      on('turn.start', (_, e) => ({ turnId: e.turnId }))
+      on('turn.complete', (_, e) => ({ text: e.answer }))
+      on('tool.call', () => ({ result: 'ok' }))
+      const files: Record<string, string> = {
+        '/proj/.knowledge/INDEX.md': '# Knowledge index\n',
+        '/proj/.knowledge/decisions.md': '# Decisions\n',
+        '/proj/.knowledge/plan.md': '# Plan: Demo\n## Phase 1: Build\n- [ ] T1: Write the parser {agent: builder, model: haiku}',
+      }
+      memFs(on, files)
+      const spawned: string[] = []
+      on('agent.spawn', (_, e) => {
+        spawned.push(e.description)
+        const verdict = decide(spawned.length)
+        if (verdict === 'refuse') return { deny: NO_VERDICT }
+        if (verdict === 'deny') return { deny: 'Agent type blocked by policy' }
+        return { model: 'claude-haiku-4-5', agentId: `ag-${spawned.length}` }
+      })
+      // The test kit answers a plugin's own spawn without an id; the mod finds the agent by its description.
+      on('agent.list', () => ({
+        value: spawned.map((d, i) => ({ id: `ag-${i + 1}`, description: d, type: 'conductor:builder', status: decide(i + 1) === 'start' ? 'running' : 'failed' })),
+      }))
+      return { files, spawned }
+    }
+
+    const pane = async ($: Engine, check: (ui: Mounted<'terminal', 'Pane'>) => Promise<void>) => {
+      const ui = await $.ui.mount({ plugin: 'conductor', surface: 'terminal', component: 'Pane', requestId: 'conductor-agents', props: PANE })
+      await check(ui)
+      await ui.unmount()
+    }
+
+    test('a refused launch is kept, not failed, and retried at the next launch point, never inside a tool call', OPTIONS, async ($, on) => {
+      const clock = mock.clock(on, { now: Date.UTC(2026, 9, 14, 12) })
+      mock.store(on)
+      const { files, spawned } = world(on, n => (n === 1 ? 'refuse' : 'start'))
+
+      await $.turn.start({ text: 'run the plan', turnId: 'm1' })
+      await $.command.run({ command: 'conductor', args: 'run' } as never)
+      await clock.advance(3000)
+      expect(spawned.length).toBe(1)
+      expect(files['/proj/.knowledge/plan.md']).toContain('- [~] T1')
+      await pane($, async ui => expect(await ui.find({ type: 'Text', text: /Couldn't start/ })).toBeUndefined())
+
+      // A tool call is no launch point: an agent launched there would skip the mod's tool.call hook.
+      await $.tool.call({ tool: 'mcp__conductor__run_plan' } as never)
+      await clock.advance(100)
+      expect(spawned.length).toBe(1)
+
+      // The main agent's turn ends: a launch point.
+      await $.turn.complete({ turnId: 'm1', answer: 'Started the run.', reason: 'answer', durationMs: 5000, isAborted: false })
+      await clock.advance(100)
+      expect(spawned.length).toBe(2)
+      await pane($, async ui => expect(await ui.find({ type: 'Text', text: /Running \(1\)/ })).toBeDefined())
+    })
+
+    test('a held launch starts once the main agent is idle', OPTIONS, async ($, on) => {
+      const clock = mock.clock(on, { now: Date.UTC(2026, 9, 14, 12) })
+      mock.store(on)
+      const { spawned } = world(on, n => (n === 1 ? 'refuse' : 'start'))
+
+      await $.turn.start({ text: 'run the plan', turnId: 'm1' })
+      await $.command.run({ command: 'conductor', args: 'run' } as never)
+      await clock.advance(3000)
+      expect(spawned.length).toBe(1)
+
+      await $.turn.complete({ turnId: 'm1', answer: 'Started the run.', reason: 'answer', durationMs: 5000, isAborted: false })
+      await clock.advance(1000)
+      expect(spawned.length).toBe(2)
+    })
+
+    test('a launch that fails for good: reason in the brief and the pane, not an attempt, and retry works', OPTIONS, async ($, on) => {
+      const clock = mock.clock(on, { now: Date.UTC(2026, 9, 14, 12) })
+      mock.store(on)
+      let isBlocked = true
+      const { files, spawned } = world(on, () => (isBlocked ? 'deny' : 'start'))
+
+      await $.command.run({ command: 'conductor', args: 'run' } as never)
+      await clock.advance(1000)
+      expect(spawned.length).toBe(1)
+      expect(files['/proj/.knowledge/plan.md']).toContain('- [!] T1')
+      expect(files['/proj/.knowledge/tasks/T1.md']).toContain('## Launch problems')
+      expect(files['/proj/.knowledge/tasks/T1.md']).toContain('Agent type blocked by policy')
+      await pane($, async ui => {
+        expect(await ui.find({ type: 'Text', text: /Couldn't start \(1\)/ })).toBeDefined()
+        expect(await ui.find({ type: 'Text', text: /failed try/ })).toBeUndefined()
+      })
+
+      isBlocked = false
+      await pane($, async ui => {
+        await ui.press({ key: 'lr-T1' })
+      })
+      await clock.advance(1000)
+      expect(spawned.length).toBe(2)
+      expect(files['/proj/.knowledge/plan.md']).toContain('- [~] T1')
+      // The retry is the task's first real attempt.
+      expect(spawned[1]).toBe('T1: Write the parser')
+    })
+  })
+
+  describe('approval and questions for later', () => {
+    function project(on: On, plan: string) {
+      on('session.root', () => ({ value: '/proj' }))
+      on('turn.complete', (_, e) => ({ text: e.answer }))
+      on('tool.call', () => ({ result: 'ok' }))
+      const files: Record<string, string> = {
+        '/proj/.knowledge/INDEX.md': '# Knowledge index\n',
+        '/proj/.knowledge/decisions.md': '# Decisions\n',
+        '/proj/.knowledge/plan.md': plan,
+      }
+      memFs(on, files)
+      const spawned: string[] = []
+      on('agent.spawn', (_, e) => {
+        spawned.push(e.description)
+        return { model: 'claude-haiku-4-5', agentId: `ag-${spawned.length}` }
+      })
+      on('agent.list', () => ({ value: spawned.map((d, i) => ({ id: `ag-${i + 1}`, description: d, type: 'conductor:builder', status: 'running' })) }))
+      return { files, spawned }
+    }
+
+    test('an approved plan stays approved when it is edited: the run does not wait again', OPTIONS, async ($, on) => {
+      const clock = mock.clock(on, { now: Date.UTC(2026, 9, 15, 12) })
+      mock.store(on)
+      const { files } = project(on, '# Plan: Demo\n## Phase 1\n- [ ] T1: First {model: haiku}')
+
+      await $.command.run({ command: 'conductor', args: 'approve' } as never)
+      files['/proj/.knowledge/plan.md'] += '\n- [ ] T2: Added by the architect {model: haiku, after: T1}'
+      const asked = await $.tool.call({ tool: 'mcp__conductor__run_plan' } as never)
+      await clock.advance(100)
+      expect(String((asked as { result?: unknown }).result)).toContain('Run started')
+      const ui = await $.ui.mount({ plugin: 'conductor', surface: 'terminal', component: 'Pane', requestId: 'conductor-agents', props: PANE })
+      expect(await ui.find({ type: 'Text', text: /ready for review/ })).toBeUndefined()
+      await ui.unmount()
+
+      // A plan with a new title is a new plan: it asks again.
+      files['/proj/.knowledge/plan.md'] = '# Plan: Something else\n## Phase 1\n- [ ] T1: Other {model: haiku}'
+      await $.command.run({ command: 'conductor', args: 'stop' } as never)
+      const again = await $.tool.call({ tool: 'mcp__conductor__run_plan' } as never)
+      expect(String((again as { result?: unknown }).result)).toContain('approve')
+    })
+
+    test('a question left for later blocks nothing, and its answer is recorded', OPTIONS, async ($, on) => {
+      const clock = mock.clock(on, { now: Date.UTC(2026, 9, 15, 12) })
+      mock.store(on)
+      const { files, spawned } = project(on, '# Plan: Demo\n## Phase 1\n- [ ] T1: Write the parser {model: haiku}')
+
+      await $.command.run({ command: 'conductor', args: 'run' } as never)
+      await clock.advance(100)
+      expect(spawned.length).toBe(1)
+      await $.turn.complete({
+        turnId: 't1',
+        agentId: 'ag-1',
+        answer: 'STATUS: done\nParser written.\n<questions>\n- Should dates be ISO or local format? → ISO 8601\n</questions>\n<knowledge>none</knowledge>',
+        reason: 'answer',
+        durationMs: 1,
+        isAborted: false,
+      })
+      await clock.advance(100)
+      expect(files['/proj/.knowledge/plan.md']).toContain('- [x] T1')
+
+      const ui = await $.ui.mount({ plugin: 'conductor', surface: 'terminal', component: 'Pane', requestId: 'conductor-agents', props: PANE })
+      expect(await ui.find({ type: 'Button', text: /For later \(1\)/ })).toBeDefined()
+      expect(await ui.find({ type: 'Text', text: /went on assuming: ISO 8601/ })).toBeDefined()
+      await ui.input({ key: 'la-l-ag-1-0', text: 'local format' })
+      await clock.advance(100)
+      expect(await ui.find({ type: 'Button', text: /For later/ })).toBeUndefined()
+      await ui.unmount()
+      expect(files['/proj/.knowledge/decisions.md']).toContain('Should dates be ISO or local format? → local format')
+      expect(files['/proj/.knowledge/tasks/T1.md']).toContain('A: local format')
+    })
+
+    test('a task ticked done while its agent ran stays done: a late report neither retries nor reopens it', OPTIONS, async ($, on) => {
+      const clock = mock.clock(on, { now: Date.UTC(2026, 9, 15, 12) })
+      mock.store(on)
+      const { files, spawned } = project(on, '# Plan: Demo\n## Phase 1\n- [ ] T1: First {model: sonnet}')
+
+      await $.command.run({ command: 'conductor', args: 'run' } as never)
+      await clock.advance(100)
+      expect(spawned.length).toBe(1)
+      files['/proj/.knowledge/plan.md'] = files['/proj/.knowledge/plan.md']!.replace('- [~] T1', '- [x] T1')
+      await $.turn.complete({ turnId: 't1', agentId: 'ag-1', answer: 'STATUS: blocked\nRan out of room.', reason: 'answer', durationMs: 1, isAborted: false })
+      await clock.advance(500)
+      expect(spawned.length).toBe(1)
+      expect(files['/proj/.knowledge/plan.md']).toContain('- [x] T1')
+    })
+
+    test('a task for the person or the main agent is never dispatched', OPTIONS, async ($, on) => {
+      const clock = mock.clock(on, { now: Date.UTC(2026, 9, 15, 12) })
+      mock.store(on)
+      const { files, spawned } = project(on, '# Plan: Demo\n## Phase 1\n- [ ] T1: Approve the look {agent: main}\n- [ ] T2: Build the rig {model: haiku}')
+
+      await $.command.run({ command: 'conductor', args: 'run' } as never)
+      await clock.advance(100)
+      expect(spawned.length).toBe(1)
+      expect(spawned[0]).toContain('T2')
+      expect(files['/proj/.knowledge/plan.md']).toContain('- [ ] T1')
+    })
+
+    test('run_plan with no tasks widens a run limited to some tasks to the whole plan', OPTIONS, async ($, on) => {
+      const clock = mock.clock(on, { now: Date.UTC(2026, 9, 15, 12) })
+      mock.store(on)
+      on('turn.start', (_, e) => ({ turnId: e.turnId }))
+      const { spawned } = project(on, '# Plan: Demo\n## Phase 1\n- [ ] T1: First {model: haiku}\n- [ ] T2: Second {model: haiku}')
+      const turn = async (turnId: string, call: () => Promise<unknown>) => {
+        await $.turn.start({ text: 'go', turnId })
+        const r = await call()
+        await $.turn.complete({ turnId, answer: 'Started.', reason: 'answer', durationMs: 1, isAborted: false })
+        await clock.advance(100)
+        return String((r as { result?: unknown }).result)
+      }
+
+      await $.command.run({ command: 'conductor', args: 'approve' } as never)
+      await turn('m1', () => $.tool.call({ tool: 'mcp__conductor__run_plan', tasks: ['T1'] } as never))
+      expect(spawned.map(d => d.slice(0, 2))).toEqual(['T1'])
+      expect(await turn('m2', () => $.tool.call({ tool: 'mcp__conductor__run_plan' } as never))).toContain('the whole plan')
+      expect(spawned.map(d => d.slice(0, 2))).toEqual(['T1', 'T2'])
+    })
+
+    test('the pane draws when the engine gives no width', OPTIONS, async ($, on) => {
+      const clock = mock.clock(on, { now: Date.UTC(2026, 9, 15, 12) })
+      mock.store(on)
+      project(on, '# Plan: Demo\n## Phase 1\n- [ ] T1: First {model: haiku}')
+
+      await $.command.run({ command: 'conductor', args: 'run' } as never)
+      await clock.advance(100)
+      const ui = await $.ui.mount({ plugin: 'conductor', surface: 'terminal', component: 'Pane', requestId: 'conductor-agents', props: { ...PANE, bodyColumns: undefined } as never })
+      expect(await ui.find({ type: 'Text', text: /could not draw/ })).toBeUndefined()
+      expect(await ui.find({ type: 'Text', text: /Running \(1\)/ })).toBeDefined()
+      await ui.unmount()
+    })
+  })
+
+  test('an agent report with colour codes or control characters still draws, on every surface', OPTIONS, async ($, on) => {
+    mock.clock(on, { now: 1000 })
+    mock.store(on)
+    on('session.root', () => ({ value: '/proj' }))
+    on('turn.complete', (_, e) => ({ text: e.answer }))
+    on('agent.spawn', (_, e) => ({ model: e.model ?? 'claude-sonnet-5-5', agentId: 'agent-1' }))
+    await $.agent.spawn({ ...SPAWN, tool_use_id: 't1', subagentType: 'conductor:builder', description: 'Run the tests', prompt: 'Run them\nPlan item: none' })
+    const answer = 'STATUS: done\r\nOutput: \u001b[32mPASS\u001b[0m 12 tests \u0007\u0008 \u0000end'
+    await $.turn.complete({ turnId: 'x', agentId: 'agent-1', answer, reason: 'answer', durationMs: 1, isAborted: false })
+
+    for (const surface of ['terminal', 'desktop'] as const) {
+      const pane = await $.ui.mount({ plugin: 'conductor', surface, component: 'Pane', requestId: 'conductor-agents', props: PANE })
+      // Rows stay open across surfaces: open it once.
+      if (surface === 'terminal') await pane.press({ key: 'tg-agent-1' })
+      expect(await pane.find({ type: 'Text', text: /PASS 12 tests/ })).toBeDefined()
+      expect(await pane.find({ type: 'Text', text: /could not draw/ })).toBeUndefined()
+      await pane.unmount()
+    }
+  })
+
+  test('/conductor diag records how the pane drew, per surface, with the mod state', OPTIONS, async ($, on) => {
+    mock.clock(on, { now: 1000 })
+    mock.store(on)
+    on('session.root', () => ({ value: '/proj' }))
+    const files: Record<string, string> = { '/proj/.knowledge/INDEX.md': '# Knowledge index\n' }
+    memFs(on, files)
+    on('agent.spawn', (_, e) => ({ model: e.model ?? 'claude-sonnet-5-5', agentId: 'agent-1' }))
+    await $.agent.spawn({ ...SPAWN, tool_use_id: 't1', subagentType: 'conductor:builder', description: 'Add invoice export', prompt: 'Implement\nPlan item: none' })
+    const pane = await $.ui.mount({ plugin: 'conductor', surface: 'desktop', component: 'Pane', requestId: 'conductor-agents', props: PANE })
+    await pane.unmount()
+
+    const reply = await $.command.run({ command: 'conductor', args: 'diag' } as never)
+    expect(JSON.stringify(reply)).toContain('pane-diag.json')
+    const diag = JSON.parse(files['/proj/.knowledge/session/pane-diag.json']!)
+    expect(diag.draws.desktop.finished).toBeGreaterThan(0)
+    expect(diag.draws.desktop.isDrawing).toBe(false)
+    expect(JSON.stringify(diag.draws.desktop.tree)).toContain('Add invoice export')
+    expect(diag.state.agents[0].description).toBe('Add invoice export')
+  })
+
+  test('the main agent may edit the knowledge base, not project files', OPTIONS, async ($, on) => {
+    on('session.root', () => ({ value: '/proj' }))
+    on('session.cwd', () => ({ value: '/proj' }))
+    const ran: string[] = []
+    on('tool.call', (_, e) => {
+      ran.push(`${e.agentId ?? 'main'}:${String((e as unknown as { file_path: string }).file_path)}`)
+      return { result: 'ok' }
+    })
+    const main = await $.tool.call({ tool: 'Edit', file_path: '/proj/src/a.ts', old_string: 'a', new_string: 'b' })
+    await $.tool.call({ tool: 'Edit', file_path: '/proj/.knowledge/decisions.md', old_string: 'a', new_string: 'b' })
+    expect(main.deny).toContain('conductor:builder')
+    expect(ran).toEqual(['main:/proj/.knowledge/decisions.md'])
+  })
+
+  test('a plan run: approval, dispatch by tags, briefs, escalation, and a question answered from the pane', OPTIONS, async ($, on) => {
+    const clock = mock.clock(on, { now: Date.UTC(2026, 9, 12, 12) })
+    const spawned: Array<{ type: string; model: string | undefined; prompt: string; description: string }> = []
+    mock.store(on)
+    on('session.root', () => ({ value: '/proj' }))
+    on('turn.complete', (_, e) => ({ text: e.answer }))
+    // A plugin's spawn ends in the Agent tool, which answers the new agent's id.
+    on('tool.call', (_, e) => (String(e.tool) === 'Agent' ? { result: { agentId: `ag-${spawned.length}` } } : { result: 'ok' }))
+    const files: Record<string, string> = {
+      '/proj/.knowledge/INDEX.md': '# Knowledge index\n',
+      '/proj/.knowledge/decisions.md': '# Decisions\n',
+      '/proj/.knowledge/plan.md': [
+        '# Plan: Demo',
+        '## Phase 1: Build',
+        '- [ ] T1: Write the parser {agent: builder, model: haiku}',
+        '- [ ] T2: Write the CLI {model: sonnet, after: T1}',
+      ].join('\n'),
+    }
+    memFs(on, files)
+    on('agent.spawn', (_, e) => {
+      spawned.push({ type: e.subagentType, model: e.model, prompt: e.prompt, description: e.description })
+      return { model: e.model ?? 'sonnet', agentId: `ag-${spawned.length}` }
+    })
+    // The test kit answers a plugin's own spawn without an id; the mod then finds the agent by its description.
+    on('agent.list', () => ({ value: spawned.map((x, i) => ({ id: `ag-${i + 1}`, description: x.description, type: x.type, status: 'running' })) }))
+    const finish = (agentId: string, answer: string) =>
+      $.turn.complete({ turnId: `turn-${agentId}`, agentId, answer, reason: 'answer', durationMs: 1, isAborted: false })
+
+    // The main agent asks for a run; it waits for the person's approval.
+    const asked = await $.tool.call({ tool: 'mcp__conductor__run_plan' } as never)
+    expect(String((asked as { result?: unknown }).result)).toContain('approve')
+    await clock.advance(100)
+    expect(spawned.length).toBe(0)
+
+    // The pane shows the plan for review, and its tasks' agent and model pickers.
+    for (const surface of ['terminal', 'desktop'] as const) {
+      const review = await $.ui.mount({ plugin: 'conductor', surface, component: 'Pane', requestId: 'conductor-agents', props: PANE })
+      expect(await review.find({ type: 'Button', text: 'approve & run' })).toBeDefined()
+      await review.press({ key: 'edit' })
+      expect(await review.find({ type: 'Select', key: 'sm-T2' })).toBeDefined()
+      await review.press({ key: 'edit' })
+      await review.unmount()
+    }
+
+    // Approved: T1 starts on the model its tag names, with a brief; T2 waits for it.
+    await $.command.run({ command: 'conductor', args: 'approve' } as never)
+    await clock.advance(100)
+    // (The test kit drops agent types no session.start registered, so the type is not checked here.)
+    expect(spawned.map(s => s.model)).toEqual(['haiku'])
+    expect(spawned[0]!.prompt).toContain('Plan item: T1')
+    expect(spawned[0]!.prompt).toContain('.knowledge/tasks/T1.md')
+    expect(files['/proj/.knowledge/plan.md']).toContain('- [~] T1')
+    expect(files['/proj/.knowledge/tasks/T1.md']).toContain('# T1: Write the parser')
+
+    // T1 finishes: ticked, its decision filed, and T2 starts with T1's result in its brief.
+    await finish('ag-1', 'STATUS: done\nParser written in src/parse.ts.\n<decisions>\n- Hand-rolled the tokenizer\n</decisions>\n<knowledge>none</knowledge>')
+    await clock.advance(500)
+    expect(files['/proj/.knowledge/plan.md']).toContain('- [x] T1')
+    expect(files['/proj/.knowledge/decisions.md']).toContain('Hand-rolled the tokenizer')
+    expect(spawned.map(s => s.model)).toEqual(['haiku', 'sonnet'])
+    expect(files['/proj/.knowledge/tasks/T2.md']).toContain('Parser written in src/parse.ts.')
+
+    // T2 falls short on Sonnet: retried on Opus, told what went wrong.
+    await finish('ag-2', 'STATUS: blocked\nThe tests for flags fail.')
+    await clock.advance(500)
+    expect(spawned.map(s => s.model)).toEqual(['haiku', 'sonnet', 'opus'])
+    expect(files['/proj/.knowledge/tasks/T2.md']).toContain('What went wrong last time')
+
+    // The retry needs the person: a question in the pane, answered with one of its options.
+    await finish('ag-3', 'STATUS: blocked\nNEEDS: Which flag parser should the CLI use?\nOPTIONS: yargs | commander')
+    await clock.advance(500)
+    expect(files['/proj/.knowledge/plan.md']).toContain('- [!] T2')
+    const onDesktop = await $.ui.mount({ plugin: 'conductor', surface: 'desktop', component: 'Pane', requestId: 'conductor-agents', props: PANE })
+    expect(await onDesktop.find({ type: 'Button', text: 'let AI decide' })).toBeDefined()
+    await onDesktop.unmount()
+    const pane = await $.ui.mount({ plugin: 'conductor', surface: 'terminal', component: 'Pane', requestId: 'conductor-agents', props: PANE })
+    expect(await pane.find({ type: 'Text', text: /Needs you \(1\)/ })).toBeDefined()
+    await pane.press({ key: 'qo-q-ag-3-0' })
+    await clock.advance(500)
+    await pane.unmount()
+    expect(files['/proj/.knowledge/tasks/T2.md']).toContain('A: yargs')
+    expect(files['/proj/.knowledge/decisions.md']).toContain('Which flag parser should the CLI use? → yargs')
+    expect(spawned.length).toBe(4)
+    expect(spawned[3]!.prompt).toContain('Plan item: T2')
+  })
+
+  test('a large tool output in the main conversation is saved to a file and cut to a pointer', OPTIONS, async ($, on) => {
+    on('session.root', () => ({ value: '/proj' }))
+    const files: Record<string, string> = {}
+    memFs(on, files)
+    const big = `${'line of build output\n'.repeat(2000)}FINAL: 3 tests failed`
+    const kept = await $.session.append({
+      message: { type: 'user', role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu1', content: big }] },
+      door: 'tool-result',
+      origin: { kind: 'tool', tool: 'Bash' },
+      uuid: 'u1',
+    } as never)
+    const spilled = Object.keys(files).find(f => f.includes('/.knowledge/session/spill/'))
+    expect(spilled).toBeDefined()
+    expect(files[spilled!]).toBe(big)
+    const text = JSON.stringify((kept as { message?: unknown }).message)
+    expect(text).toContain('FINAL: 3 tests failed')
+    expect(text.length).toBeLessThan(5000)
+  })
+})

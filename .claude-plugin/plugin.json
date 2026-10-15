@@ -1,0 +1,158 @@
+{
+  "name": "conductor",
+  "version": "0.1.0",
+  "author": { "name": "Nathan" },
+  "description": "Turns the main agent into a conductor: delegates work to subagents on the cheapest model that fits, keeps a project knowledge base and plan, and keeps the main context small.",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "delegation": {
+      "type": "string",
+      "title": "Delegation",
+      "description": "enforce: the main agent may not edit project files and must delegate. guide: the system prompt asks it to delegate. off: the mod only watches.",
+      "options": ["enforce", "guide", "off"],
+      "default": "enforce"
+    },
+    "routing": {
+      "type": "string",
+      "title": "Model routing",
+      "description": "auto: pick a model when the main agent did not name one. force: always pick. off: leave models alone.",
+      "options": ["auto", "force", "off"],
+      "default": "auto"
+    },
+    "topModel": {
+      "type": "string",
+      "title": "Top model",
+      "description": "The model the router gives the hardest tasks.",
+      "options": ["opus", "fable", "sonnet"],
+      "default": "opus"
+    },
+    "classifier": {
+      "type": "boolean",
+      "title": "Haiku tie-breaker",
+      "description": "Ask Haiku to classify a task when the keyword router is unsure (a fraction of a cent per spawn).",
+      "default": true
+    },
+    "checkpointPercent": {
+      "type": "number",
+      "title": "Checkpoint at (% context)",
+      "description": "Write the session handoff note once the main context passes this fill.",
+      "default": 45
+    },
+    "compactPercent": {
+      "type": "number",
+      "title": "Compact at (% context)",
+      "description": "Checkpoint and compact the main conversation once its context passes this fill.",
+      "default": 65
+    },
+    "compactTokens": {
+      "type": "number",
+      "title": "Compact at (tokens)",
+      "description": "Also compact once the main context holds this many tokens, whatever the window size.",
+      "default": 130000
+    },
+    "curateEvery": {
+      "type": "number",
+      "title": "Curate after N notes",
+      "description": "Run the Haiku curator once this many subagent notes wait in the inbox.",
+      "default": 5
+    },
+    "bootstrapKnowledge": {
+      "type": "boolean",
+      "title": "Bootstrap knowledge",
+      "description": "When the knowledge base is first created in a project with code, have Haiku survey it and write the first notes.",
+      "default": true
+    },
+    "showPane": {
+      "type": "boolean",
+      "title": "Agents pane",
+      "description": "Open the agents pane when the session starts and when agents are spawned.",
+      "default": true
+    },
+    "autonomy": {
+      "type": "string",
+      "title": "Agents ask you",
+      "description": "ask-all: about any open choice. ask-important: only about scope, interfaces, dependencies, data, security, cost or irreversible choices. ask-blocking: only when they cannot continue. decide-all: never; they decide and log it in decisions.md.",
+      "options": ["ask-all", "ask-important", "ask-blocking", "decide-all"],
+      "default": "ask-important"
+    },
+    "requireApproval": {
+      "type": "boolean",
+      "title": "Approve plans",
+      "description": "A plan run waits until you approve the plan in the agents pane.",
+      "default": true
+    },
+    "approveOwnAgents": {
+      "type": "boolean",
+      "title": "Approve own launches",
+      "description": "Approve the agents the conductor launches itself (plan runs, verifiers, upkeep). They come from no model request, so auto mode cannot judge them and other modes would ask for each. The launched agents' own actions are still decided by your permission mode.",
+      "default": true
+    },
+    "requirePlanItem": {
+      "type": "boolean",
+      "title": "Plan-first gate",
+      "description": "In enforce mode, refuse builder tasks whose prompt names no plan task (Plan item: T<n>, or Plan item: none).",
+      "default": true
+    },
+    "maxParallel": {
+      "type": "number",
+      "title": "Parallel tasks",
+      "description": "How many plan tasks a run works on at once.",
+      "default": 4
+    },
+    "verify": {
+      "type": "string",
+      "title": "Verify tasks",
+      "description": "tagged: a Haiku verifier checks tasks that have a verify: tag. always: every finished task. off: none.",
+      "options": ["tagged", "always", "off"],
+      "default": "tagged"
+    },
+    "escalate": {
+      "type": "boolean",
+      "title": "Escalate failures",
+      "description": "Retry a run task that failed or did not verify on the next stronger model (up to three tries).",
+      "default": true
+    },
+    "learnRouting": {
+      "type": "boolean",
+      "title": "Learn routing",
+      "description": "Move a kind of task to a stronger model once it keeps failing on a cheaper one.",
+      "default": true
+    },
+    "spillChars": {
+      "type": "number",
+      "title": "Spill outputs over (chars)",
+      "description": "Tool outputs in the main chat longer than this are saved to .knowledge/session/spill/ and replaced by their head, tail and a pointer.",
+      "default": 12000
+    },
+    "mapEvery": {
+      "type": "number",
+      "title": "Update code map after N files",
+      "description": "Run knowledge upkeep (code map and stale facts) once this many files have changed.",
+      "default": 8
+    },
+    "rateLimitDownshift": {
+      "type": "number",
+      "title": "Rate-limit cap at (%)",
+      "description": "When a rate-limit window passes this percentage, new tasks are capped at Sonnet. 0 turns it off.",
+      "default": 85
+    },
+    "dailyBudgetUsd": {
+      "type": "number",
+      "title": "Daily budget (USD)",
+      "description": "Across sessions, in API-equivalent dollars. Near it the conductor wraps up: no new tasks, running agents finish. Models are never changed for it. 0 turns it off.",
+      "default": 0
+    },
+    "budgetWrapUpPercent": {
+      "type": "number",
+      "title": "Wrap up at (% of budget)",
+      "description": "When today's spend reaches this share of the daily budget, the conductor starts wrapping up.",
+      "default": 90
+    },
+    "sound": {
+      "type": "boolean",
+      "title": "Notification sound",
+      "description": "Play a chime when a run finishes, a task needs you, or the budget wrap-up starts.",
+      "default": true
+    }
+  }
+}
