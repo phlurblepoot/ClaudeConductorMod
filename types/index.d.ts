@@ -140,6 +140,9 @@ export type ConductorSpend = Record<ConductorTier, ConductorSpendRow>
 
 export type ConductorAutonomy = 'ask-all' | 'ask-important' | 'ask-blocking' | 'decide-all'
 
+/** One suggested answer to a question: a short label, a plain explanation, and whether the agent recommends it. */
+export type ConductorChoice = { label: string; detail: string; isRecommended: boolean }
+
 /** A question an agent stopped on, waiting in the pane's Needs-you queue. */
 export type ConductorQuestion = {
   id: string
@@ -149,6 +152,10 @@ export type ConductorQuestion = {
   from: string
   question: string
   options: string[]
+  /** Why the agent is asking, in plain words. Empty for old questions. */
+  why: string
+  /** Suggested answers (up to 5), same labels as `options`. For old questions, built from `options` with no detail. */
+  choices: ConductorChoice[]
   askedAt: number
 }
 
@@ -156,7 +163,7 @@ export type ConductorQuestion = {
 export type ConductorToday = { day: string; usd: number; isWrappingUp: boolean }
 
 /** A question an agent left for the person without stopping: it went on with `assumed`. */
-export type ConductorLaterQuestion = { id: string; itemId: string | null; from: string; question: string; assumed: string; askedAt: number }
+export type ConductorLaterQuestion = { id: string; itemId: string | null; from: string; question: string; assumed: string; why: string; choices: ConductorChoice[]; chosen: number | null; askedAt: number }
 
 /** A plan task whose agent could not be launched: why, when, after how many tries. Not an attempt at the task. */
 export type ConductorLaunchIssue = { reason: string; at: number; tries: number; model: string }
@@ -200,6 +207,8 @@ declare module 'claude-code' {
       laterQuestions: ConductorLaterQuestion[]
       /** The agents pane: whether the person closed it (unasked opens then skip it), and why the engine left it waiting. */
       pane: { isClosedByPerson: boolean; waiting: string | null }
+      /** The Questions pane, same shape. */
+      questionsPane: { isClosedByPerson: boolean; waiting: string | null }
       questions: ConductorQuestion[]
       /** The signature of the plan the person approved. */
       approval: string | null

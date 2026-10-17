@@ -4,6 +4,7 @@ import type { AgentInfo, AgentSpawnArgs, AgentSpawnResult, EngineInterface, Plug
 import type {
   ConductorAgent,
   ConductorAgentStatus,
+  ConductorChoice,
   ConductorContext,
   ConductorEffort,
   ConductorMode,
@@ -23,6 +24,7 @@ import { DOT, DOT_TONE, STATUS_DOT, STATUS_TONE, cleanText, cleanTree, drawBar, 
 import type { Table } from './draw'
 import type { BarKind } from './draw'
 import { describeCall, extractDecisions, extractKnowledge, extractNeeds, extractQuestions, extractStatus, stripTagged } from './notes'
+import type { Needs } from './notes'
 import type { LaterQuestion } from './notes'
 import {
   PLAN_TEMPLATE,
@@ -103,8 +105,10 @@ const budgetA = atom({ plugin: 'conductor', key: 'budgetUsd' } as const, null)
 const launchIssuesA = atom({ plugin: 'conductor', key: 'launchIssues' } as const, {})
 const laterQuestionsA = atom({ plugin: 'conductor', key: 'laterQuestions' } as const, [])
 const paneStateA = atom({ plugin: 'conductor', key: 'pane' } as const, { isClosedByPerson: false, waiting: null })
+const questionsPaneA = atom({ plugin: 'conductor', key: 'questionsPane' } as const, { isClosedByPerson: false, waiting: null })
 
 const PANE = 'conductor-agents'
+const QPANE = 'conductor-questions'
 const CHIME = 'assets/chime.wav'
 const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit'])
 const TASK_TOOLS = new Set(['TodoWrite', 'TaskCreate', 'TaskUpdate'])
@@ -664,6 +668,7 @@ async function refreshStatus($: $) {
   const later = (await read($, laterQuestionsA)).length
   if (later) parts.push(`${later} for later`)
   if ((await read($, paneStateA)).waiting) parts.push('pane hidden: /conductor pane')
+  if ((await read($, questionsPaneA)).waiting) parts.push('questions pane hidden: /conductor questions')
   const issues = Object.keys(await read($, launchIssuesA)).length
   if (issues) parts.push(`${issues} couldn't start`)
   $.ui.status(parts.join(' · '))
@@ -675,17 +680,20 @@ async function refreshStatus($: $) {
  * unasked open of an open pane could only move it to "waiting" on a narrow window. When the engine leaves it
  * waiting, the status line and the band say so, with a button that opens it.
  */
-async function openPane($: $, isAsked = false) {
+async function openPane($: $, isAsked = false, which: 'agents' | 'questions' = 'agents') {
+  const id = which === 'questions' ? QPANE : PANE
   try {
     if (!isAsked) {
-      if ((await read($, paneStateA)).isClosedByPerson) return
-      if ((await $.ui.panes()).some(p => p.id === PANE)) return
+      if ((which === 'questions' ? (await read($, questionsPaneA)).isClosedByPerson : (await read($, paneStateA)).isClosedByPerson)) return
+      if ((await $.ui.panes()).some(p => p.id === id)) return
     }
-    const r = await $.ui.open({ id: PANE, title: 'Agents' })
-    await update($, paneStateA, s => ({ isClosedByPerson: isAsked ? false : s.isClosedByPerson, waiting: r.isPlaced ? null : r.reason }))
+    const r = await $.ui.open({ id, title: which === 'questions' ? 'Questions' : 'Agents' })
+    const waiting = r.isPlaced ? null : r.reason
+    if (which === 'questions') await update($, questionsPaneA, s => ({ isClosedByPerson: isAsked ? false : s.isClosedByPerson, waiting }))
+    else await update($, paneStateA, s => ({ isClosedByPerson: isAsked ? false : s.isClosedByPerson, waiting }))
     await refreshStatus($)
   } catch (err) {
-    $.ui.log(`conductor: could not open the agents pane: ${String(err)}`)
+    $.ui.log(`conductor: could not open the ${which} pane: ${String(err)}`)
   }
 }
 
@@ -1143,7 +1151,7 @@ async function addQuestion($: $, q: ConductorQuestion) {
   await update($, questionsA, list => [...list.filter(x => x.agentId !== q.agentId), q].slice(-20))
   notify($, `${q.itemId ?? q.from} needs you: ${clipText(q.question, 80)}`, true)
   await refreshStatus($)
-  if (cfg.showPane) void openPane($)
+  if (cfg.showPane) void openPane($, false, 'questions')
 }
 
 /** The person's answer to a question: written to the brief and decisions, the task back in the queue. */
@@ -1188,7 +1196,7 @@ async function addLaterQuestions($: $, row: ConductorAgent, qs: readonly LaterQu
     const known = new Set(list.map(q => q.question))
     const added = qs
       .filter(q => q.question && !known.has(q.question))
-      .map((q, i) => ({ id: `l-${row.id}-${i}`, itemId, from: row.description, question: q.question, assumed: q.assumed, askedAt: now }))
+      .map((q, i) => ({ id: `l-${row.id}-${i}`, itemId, from: row.description, question: q.question, assumed: q.assumed, why: q.why, choices: q.choices, chosen: q.chosen, askedAt: now }))
     return uniqueIds([...list, ...added]).slice(-30)
   })
   notify($, `${plural(qs.length, 'question')} for later from ${itemId ?? row.description}: no rush, work goes on.`, false)
@@ -1236,6 +1244,12 @@ async function answerLater($: $, qid: string, answer: string, how: 'answer' | 'k
     )
   }
   notify($, 'answer recorded.', false)
+}
+
+/** Empties the For later list without recording anything, like dismissing each question. */
+async function dismissAllLater($: $) {
+  await update($, laterQuestionsA, () => [])
+  await refreshStatus($)
 }
 
 // ---------------------------------------------------------------- plan runs
@@ -1555,7 +1569,7 @@ async function completeAgent($: $, agentId: string, answer: string, reason: stri
   else if (row.role === 'upkeep') await finishUpkeep($, status === 'done')
   else if (isTaskRef(row.planItem)) await onTaskReport($, row, { status, isOk, reason, needs, summary })
   else if (needs) {
-    await addQuestion($, { id: `q-${agentId}`, itemId: null, agentId, from: row.description, question: needs.question, options: needs.options, askedAt: now })
+    await addQuestion($, { id: `q-${agentId}`, itemId: null, agentId, from: row.description, question: needs.question, options: needs.options, why: needs.why, choices: needs.choices, askedAt: now })
   }
 
   if (row.role !== 'upkeep') whenFramed(() => maybeUpkeep($))
@@ -1563,7 +1577,7 @@ async function completeAgent($: $, agentId: string, answer: string, reason: stri
   await refreshStatus($)
 }
 
-type TaskOutcome = { status: ConductorAgentStatus; isOk: boolean; reason: string; needs: { question: string; options: string[] } | null; summary: string }
+type TaskOutcome = { status: ConductorAgentStatus; isOk: boolean; reason: string; needs: Needs | null; summary: string }
 
 async function onTaskReport($: $, row: ConductorAgent, o: TaskOutcome) {
   const id = row.planItem!
@@ -1591,7 +1605,7 @@ async function onTaskReport($: $, row: ConductorAgent, o: TaskOutcome) {
   }
   if (o.needs) {
     await markPlan($, id, 'blocked')
-    await addQuestion($, { id: `q-${row.id}`, itemId: id, agentId: row.id, from: row.description, question: o.needs.question, options: o.needs.options, askedAt: now })
+    await addQuestion($, { id: `q-${row.id}`, itemId: id, agentId: row.id, from: row.description, question: o.needs.question, options: o.needs.options, why: o.needs.why, choices: o.needs.choices, askedAt: now })
     return
   }
   const item = itemById(await read($, planA), id)
@@ -1923,8 +1937,18 @@ async function tidyState($: $) {
   await update($, agentsA, list =>
     (Array.isArray(list) ? list : []).filter(a => a && typeof a.id === 'string').map(a => ({ ...ROW_DEFAULTS, ...a, description: str(a.description) || a.id, model: str(a.model) || '?' }) as ConductorAgent),
   )
-  await update($, questionsA, list => (Array.isArray(list) ? list.filter(q => q && typeof q.id === 'string').map(q => ({ ...q, options: Array.isArray(q.options) ? q.options : [] })) : []))
-  await update($, laterQuestionsA, list => uniqueIds(Array.isArray(list) ? list.filter(q => q && typeof q.id === 'string').map(q => ({ ...q, assumed: str(q.assumed), from: str(q.from) })) : []))
+  await update($, questionsA, list =>
+    Array.isArray(list)
+      ? list
+          .filter(q => q && typeof q.id === 'string')
+          .map(q => {
+            const options: string[] = Array.isArray(q.options) ? q.options.filter((o: unknown): o is string => typeof o === 'string') : []
+            const choices: ConductorChoice[] = Array.isArray(q.choices) ? q.choices : options.map(label => ({ label, detail: '', isRecommended: false }))
+            return { ...q, options, why: str(q.why), choices }
+          })
+      : [],
+  )
+  await update($, laterQuestionsA, list => uniqueIds(Array.isArray(list) ? list.filter(q => q && typeof q.id === 'string').map(q => ({ ...q, assumed: str(q.assumed), from: str(q.from), why: str(q.why), choices: Array.isArray(q.choices) ? q.choices : [], chosen: typeof q.chosen === 'number' ? q.chosen : null })).filter(q => q.choices.length > 0 || q.assumed !== '' || String(q.question ?? '').includes('?')) : []))
   await update($, launchIssuesA, m => (m && typeof m === 'object' ? m : {}))
   await update($, runA, r => (r ? { ...r, done: Array.isArray(r.done) ? r.done : [], blocked: Array.isArray(r.blocked) ? r.blocked : [], only: Array.isArray(r.only) ? r.only : null } : r))
   await update($, expandedA, m => (m && typeof m === 'object' ? m : {}))
@@ -1935,8 +1959,14 @@ type DrawRecord = { started: number; finished: number; lastStartAt: number; last
 const paneDraws: Record<string, DrawRecord> = {}
 
 /** Draws through `draw`; when drawing throws, a short note says why instead of the engine dropping the pane. */
-async function safeDraw($: $, table: () => Table, site: { surface: string; props: unknown }, draw: () => Promise<RenderElement>): Promise<RenderElement> {
-  const rec = (paneDraws[site.surface] ??= { started: 0, finished: 0, lastStartAt: 0, lastEndAt: 0, lastMs: 0, lastError: '', chars: 0, nodes: 0, props: null, tree: null })
+async function safeDraw(
+  $: $,
+  table: () => Table,
+  site: { surface: string; props: unknown; pane?: 'agents' | 'questions' },
+  draw: () => Promise<RenderElement>,
+): Promise<RenderElement> {
+  const isQuestions = site.pane === 'questions'
+  const rec = (paneDraws[isQuestions ? `questions/${site.surface}` : site.surface] ??= { started: 0, finished: 0, lastStartAt: 0, lastEndAt: 0, lastMs: 0, lastError: '', chars: 0, nodes: 0, props: null, tree: null })
   const startedAt = Date.now()
   rec.started += 1
   rec.lastStartAt = startedAt
@@ -1957,12 +1987,12 @@ async function safeDraw($: $, table: () => Table, site: { surface: string; props
     rec.lastEndAt = Date.now()
     if (message !== lastDrawError) {
       lastDrawError = message
-      $.ui.log(`conductor: the agents pane could not draw: ${message}`)
+      $.ui.log(`conductor: the ${isQuestions ? 'questions' : 'agents'} pane could not draw: ${message}`)
     }
     const { Box, Text, Button } = table()
     return (
       <Box flexDirection="column">
-        <Text color="error">The agents pane could not draw.</Text>
+        <Text color="error">{isQuestions ? 'The Questions pane could not draw.' : 'The agents pane could not draw.'}</Text>
         <Text dimColor wrap="wrap">
           {cleanText(clipText(message, 300))}
         </Text>
@@ -1999,6 +2029,7 @@ async function writeDiag($: $): Promise<string> {
     attempts: await read($, attemptsA),
     approval: await read($, approvalA),
     pane: await read($, paneStateA),
+    questionsPane: await read($, questionsPaneA),
     mode: await modeOf($),
     plan: plan ? { title: plan.title, total: plan.total, done: plan.done, items: plan.items.length } : null,
   }
@@ -2157,6 +2188,8 @@ export const register: Register = (on, options) => {
     }
 
     await tidyState($)
+    // Urgent questions already waiting: show them unasked (openPane skips an open pane or one the person closed).
+    if (cfg.showPane && (await read($, questionsA)).length) void openPane($, false, 'questions')
     const learned = await $.store.get('routing')
     if (learned && typeof learned === 'object') await update($, routingA, () => learned as Record<string, never>)
     const today = dayOf(await $.clock.now())
@@ -2337,7 +2370,7 @@ export const register: Register = (on, options) => {
 
     const p = await paths($)
     const strip = (text: string) =>
-      isReport ? stripTagged(stripTagged(stripTagged(text, 'knowledge', `${P.KDIR}/inbox.md`), 'decisions', `${P.KDIR}/decisions.md`), 'questions', 'the agents pane') : text
+      isReport ? stripTagged(stripTagged(stripTagged(text, 'knowledge', `${P.KDIR}/inbox.md`), 'decisions', `${P.KDIR}/decisions.md`), 'questions', 'the Questions pane') : text
     const content: typeof e.message.content = []
     let isChanged = false
     for (const b of e.message.content) {
@@ -2559,6 +2592,12 @@ export const register: Register = (on, options) => {
         const waiting = (await read($, paneStateA)).waiting
         return { text: waiting ? `The agents pane is waiting to be placed: ${waiting}` : 'Agents pane opened.' }
       }
+      case 'questions':
+      case 'q': {
+        await openPane($, true, 'questions')
+        const waiting = (await read($, questionsPaneA)).waiting
+        return { text: waiting ? `The Questions pane is waiting to be placed: ${waiting}` : 'Questions pane opened.' }
+      }
       case 'diag':
         return { text: await writeDiag($) }
       case 'run':
@@ -2710,6 +2749,114 @@ export const register: Register = (on, options) => {
   on('ui.press', async ($, e, next) => (e.plugin === $.plugin.name ? framedHandler($, () => next(e)) : next(e)))
   on('ui.input', async ($, e, next) => (e.plugin === $.plugin.name ? framedHandler($, () => next(e)) : next(e)))
   on('ui.select', async ($, e, next) => (e.plugin === $.plugin.name ? framedHandler($, () => next(e)) : next(e)))
+
+  on('ui.render', { component: 'Pane', requestId: QPANE }, async ($, e) => safeDraw($, () => $.ui.resolve(e), { surface: e.surface, props: e.props, pane: 'questions' }, async () => {
+    const t = $.ui.resolve(e)
+    const { Box, Text, Button } = t
+    const questions = await read($, questionsA)
+    const later = await read($, laterQuestionsA)
+    const open = await read($, expandedA)
+    const isLaterOpen = open.later ?? true
+    const Input = hasInput(t) ? t.Input : null
+
+    const tag = (q: { itemId: string | null; from: string; question: string }) => (
+      <Text wrap="wrap">
+        <Text color="claude">{q.itemId ?? clipText(q.from, 30)}</Text> {q.question}
+      </Text>
+    )
+    const why = (q: { why?: string }) =>
+      (q.why ?? '') !== '' && (
+        <Text dimColor wrap="wrap">
+          Why it matters: {q.why}
+        </Text>
+      )
+    // One column per suggested answer: the button (and its marks), the explanation under it.
+    const choiceRows = (
+      prefix: string,
+      qid: string,
+      q: { choices?: ConductorChoice[]; options?: string[] },
+      chosen: number | null,
+      onPick: (label: string, i: number) => void,
+    ) => {
+      const choices: ConductorChoice[] = (q.choices ?? []).length > 0 ? (q.choices ?? []) : (q.options ?? []).map(label => ({ label, detail: '', isRecommended: false }))
+      return choices.map((c, i) => (
+        <Box key={`${prefix}w-${qid}-${i}`} flexDirection="column">
+          <Box flexDirection="row" gap={1}>
+            <Button key={`${prefix}-${qid}-${i}`} label={c.label} onPress={() => onPick(c.label, i)} />
+            {c.isRecommended && <Text color="success">recommended</Text>}
+            {chosen === i && <Text dimColor>the agent went with this</Text>}
+          </Box>
+          {(c.detail ?? '') !== '' && (
+            <Box paddingLeft={2}>
+              <Text dimColor wrap="wrap">
+                {c.detail}
+              </Text>
+            </Box>
+          )}
+        </Box>
+      ))
+    }
+
+    return (
+      <Box flexDirection="column">
+        {questions.length === 0 && later.length === 0 && <Text dimColor>No questions right now.</Text>}
+
+        {questions.length > 0 && (
+          <Box flexDirection="column" marginBottom={1}>
+            <Text bold color="warning">
+              Needs you ({questions.length})
+            </Text>
+            <Text dimColor>these tasks wait for your answer</Text>
+            {questions.map(q => (
+              <Box key={`q-${q.id}`} flexDirection="column" paddingLeft={1} marginBottom={1}>
+                {tag(q)}
+                {why(q)}
+                {choiceRows('qo', q.id, q, null, label => act(answerQuestion($, q.id, label, 'user')))}
+                {Input && <Input key={`qa-${q.id}`} placeholder="Other: write your own answer" submitLabel="send" onSubmit={v => act(answerQuestion($, q.id, v, 'user'))} />}
+                <Box flexDirection="row" gap={1}>
+                  <Button key={`qd-${q.id}`} label="let AI decide" onPress={() => act(answerQuestion($, q.id, '', 'delegate'))} />
+                  <Button key={`qx-${q.id}`} plain dimColor label="dismiss" onPress={() => act(answerQuestion($, q.id, '', 'dismiss'))} />
+                </Box>
+              </Box>
+            ))}
+          </Box>
+        )}
+
+        {later.length > 0 && (
+          <Box flexDirection="column" marginBottom={1}>
+            <Box flexDirection="row" gap={1}>
+              <Button
+                key="tg-later"
+                plain
+                label={`${isLaterOpen ? '▾' : '▸'} For later (${later.length})`}
+                onPress={() => void update($, expandedA, m => ({ ...m, later: !(m.later ?? true) }))}
+              />
+              <Text dimColor>no rush: work goes on</Text>
+              {later.length >= 2 && <Button key="ld-all" plain dimColor label="dismiss all" onPress={() => act(dismissAllLater($))} />}
+            </Box>
+            {isLaterOpen &&
+              later.map(q => (
+                <Box key={`lq-${q.id}`} flexDirection="column" paddingLeft={1} marginBottom={1}>
+                  {tag(q)}
+                  {why(q)}
+                  {choiceRows('lo', q.id, q, q.chosen ?? null, (label, i) => act(i === q.chosen ? answerLater($, q.id, '', 'keep') : answerLater($, q.id, label, 'answer')))}
+                  {(q.choices ?? []).length === 0 && (q.assumed ?? '') !== '' && (
+                    <Text dimColor wrap="wrap">
+                      went on assuming: {q.assumed}
+                    </Text>
+                  )}
+                  {Input && <Input key={`la-${q.id}`} placeholder="Other: write your own answer" submitLabel="send" onSubmit={v => act(answerLater($, q.id, v, 'answer'))} />}
+                  <Box flexDirection="row" gap={1}>
+                    {(q.assumed ?? '') !== '' && <Button key={`lk-${q.id}`} label="keep what the agent chose" onPress={() => act(answerLater($, q.id, '', 'keep'))} />}
+                    <Button key={`ld-${q.id}`} plain dimColor label="dismiss" onPress={() => act(answerLater($, q.id, '', 'dismiss'))} />
+                  </Box>
+                </Box>
+              ))}
+          </Box>
+        )}
+      </Box>
+    )
+  }))
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => safeDraw($, () => $.ui.resolve(e), { surface: e.surface, props: e.props }, async () => {
     const t = $.ui.resolve(e)
@@ -2875,33 +3022,14 @@ export const register: Register = (on, options) => {
 
     return (
       <Box flexDirection="column">
-        {questions.length > 0 && (
-          <Box flexDirection="column" marginBottom={1}>
-            <Text bold color="warning">
-              Needs you ({questions.length})
+        {(questions.length > 0 || laterQuestions.length > 0) && (
+          <Box flexDirection="row" gap={1} marginBottom={1} flexWrap="wrap">
+            <Text color={questions.length > 0 ? 'warning' : undefined} dimColor={questions.length === 0}>
+              {`Questions: ${[questions.length ? `${questions.length} need you` : '', laterQuestions.length ? `${laterQuestions.length} for later` : ''].filter(Boolean).join(' · ')}`}
             </Text>
-            {questions.map(q => (
-              <Box key={`q-${q.id}`} flexDirection="column" paddingLeft={1} marginBottom={1}>
-                <Text wrap="wrap">
-                  <Text color="claude">{q.itemId ?? clipText(q.from, 30)}</Text> {q.question}
-                </Text>
-                {q.options.length > 0 && (
-                  <Box flexDirection="row" gap={1} flexWrap="wrap">
-                    {q.options.map((o, oi) => (
-                      <Button key={`qo-${q.id}-${oi}`} label={o} onPress={() => act(answerQuestion($, q.id, o, 'user'))} />
-                    ))}
-                  </Box>
-                )}
-                {Input && <Input key={`qa-${q.id}`} placeholder="type your answer" submitLabel="send" onSubmit={v => act(answerQuestion($, q.id, v, 'user'))} />}
-                <Box flexDirection="row" gap={1}>
-                  <Button key={`qd-${q.id}`} label="let AI decide" onPress={() => act(answerQuestion($, q.id, '', 'delegate'))} />
-                  <Button key={`qx-${q.id}`} plain dimColor label="dismiss" onPress={() => act(answerQuestion($, q.id, '', 'dismiss'))} />
-                </Box>
-              </Box>
-            ))}
+            <Button key="open-questions" label="open questions" onPress={() => act(openPane($, true, 'questions'))} />
           </Box>
         )}
-
         {Object.keys(launchIssues).length > 0 && (
           <Box flexDirection="column" marginBottom={1}>
             <Text bold color="error">
@@ -2918,33 +3046,6 @@ export const register: Register = (on, options) => {
                 </Box>
               </Box>
             ))}
-          </Box>
-        )}
-
-        {laterQuestions.length > 0 && (
-          <Box flexDirection="column" marginBottom={1}>
-            <Box flexDirection="row" gap={1}>
-              <Button key="tg-later" plain label={`${isOpen('later', true) ? '▾' : '▸'} For later (${laterQuestions.length})`} onPress={toggle('later', true)} />
-              <Text dimColor>no rush: work goes on</Text>
-            </Box>
-            {isOpen('later', true) &&
-              laterQuestions.map(q => (
-                <Box key={`lq-${q.id}`} flexDirection="column" paddingLeft={1} marginBottom={1}>
-                  <Text wrap="wrap">
-                    <Text color="claude">{q.itemId ?? clipText(q.from, 30)}</Text> {q.question}
-                  </Text>
-                  {q.assumed !== '' && (
-                    <Text dimColor wrap="wrap">
-                      went on assuming: {q.assumed}
-                    </Text>
-                  )}
-                  {Input && <Input key={`la-${q.id}`} placeholder="answer when you like" submitLabel="send" onSubmit={v => act(answerLater($, q.id, v, 'answer'))} />}
-                  <Box flexDirection="row" gap={1}>
-                    {q.assumed !== '' && <Button key={`lk-${q.id}`} label="keep assumption" onPress={() => act(answerLater($, q.id, '', 'keep'))} />}
-                    <Button key={`ld-${q.id}`} plain dimColor label="dismiss" onPress={() => act(answerLater($, q.id, '', 'dismiss'))} />
-                  </Box>
-                </Box>
-              ))}
           </Box>
         )}
 
@@ -3141,6 +3242,10 @@ export const register: Register = (on, options) => {
 
   // Remembers a close by the person, so no launch or run re-opens the pane uninvited.
   on('ui.close', async ($, e, next) => {
+    if (e.id === QPANE) {
+      await update($, questionsPaneA, s => ({ isClosedByPerson: e.origin.kind === 'person' ? true : s.isClosedByPerson, waiting: null }))
+      await refreshStatus($)
+    }
     if (e.id === PANE) {
       await update($, paneStateA, s => ({ isClosedByPerson: e.origin.kind === 'person' ? true : s.isClosedByPerson, waiting: null }))
       await refreshStatus($)
@@ -3164,7 +3269,7 @@ export const register: Register = (on, options) => {
       const laterCount = (await read($, laterQuestionsA)).length
       const paneWaiting = (await read($, paneStateA)).waiting !== null
       const running = agents.filter(a => a.status === 'running')
-      if (isHidden || (await modeOf($)) === 'off' || (!plan && running.length === 0 && questions.length === 0)) return next(e)
+      if (isHidden || (await modeOf($)) === 'off' || (!plan && running.length === 0 && questions.length === 0 && laterCount === 0)) return next(e)
 
       const t = $.ui.resolve(e)
       const { Box, Text, Button } = t
@@ -3199,9 +3304,10 @@ export const register: Register = (on, options) => {
           {plan && drawBar(t, e.surface, 'plan', frac, barCells, planMarks(items, barCells), `Project ${pctOf(frac)}% done`)}
           {plan && <Text bold>{pctOf(frac)}%</Text>}
           {runChip !== '' && <Text color={run?.isActive && !run.isPaused ? 'success' : 'warning'}>{runChip}</Text>}
-          {questions.length > 0 && <Text color="warning">{questions.length} need you</Text>}
+          {questions.length + laterCount > 0 && (
+            <Button key="questions-chip" plain label={[questions.length ? `${questions.length} need you` : '', laterCount ? `${laterCount} for later` : ''].filter(Boolean).join(' · ')} onPress={() => act(openPane($, true, 'questions'))} />
+          )}
           {issueCount > 0 && <Text color="error">{issueCount} couldn't start</Text>}
-          {laterCount > 0 && <Text dimColor>{laterCount} for later</Text>}
           <Text dimColor wrap="truncate-end">
             {details.filter(Boolean).join(' · ')}
           </Text>

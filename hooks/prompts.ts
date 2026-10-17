@@ -25,14 +25,36 @@ export const AUTONOMY_LABEL: Record<Autonomy, string> = {
   'decide-all': 'never ask: decide and log',
 }
 
-const ASK = 'stop and ask: end with `STATUS: blocked`, a line `NEEDS: <your question>`, and optionally `OPTIONS: a | b | c`'
-const LATER = 'Anything else the user may want to weigh in on: choose, carry on, and list it under <questions> with what you assumed; that stops nothing.'
+/** The one plain-language rule for every question put to the user. */
+export const PLAIN =
+  'Write every question for someone who is not an expert in the subject: plain words; say what is being decided and what each choice changes for them in practice; explain any term you cannot avoid in a few words; no ids, file paths or code unless they need them to answer.'
+
+/** Templates of the two question formats; the protocol shows them and the tests parse them. */
+export const URGENT_EXAMPLE = `NEEDS: Should the report show prices with tax included?
+WHY: Customers see these numbers, and changing them later means redoing every report.
+1. Include tax — customers see the final price they pay (recommended)
+2. Leave tax out — prices look lower but need a note about tax`
+
+export const LATER_EXAMPLE = `Q: Should old reports be kept after the upgrade?
+WHY: They take space but cannot be rebuilt.
+1. Keep them — nothing is lost, uses more disk space (recommended)
+2. Delete them — saves space, cannot be undone
+WENT WITH: 1
+
+Q: Which name should the new folder have?
+WHY: It only changes how the folder looks in a file list.
+1. reports-2026 — matches the year (recommended)
+2. new-reports — shorter
+WENT WITH: 1`
+
+const ASK = 'stop and ask: end with `STATUS: blocked` and a `NEEDS:` question in the protocol\'s format (item 1)'
+const LATER = `Anything else the user may want to weigh in on: choose, carry on, and list it under <questions> in the protocol's format (item 4), giving the option you went with; that stops nothing. ${PLAIN}`
 
 /** The decision policy every working agent gets in its task prompt. */
 export function policyLine(level: Autonomy): string {
   switch (level) {
     case 'ask-all':
-      return `Decision policy: for any choice the task and its brief do not settle (approach, naming, scope, libraries, data shape), ${ASK}.`
+      return `Decision policy: for any choice the task and its brief do not settle (approach, naming, scope, libraries, data shape), ${ASK}. ${PLAIN}`
     case 'ask-important':
       return `Decision policy: make routine choices yourself and list them under <decisions>. Only for an urgent choice, one that changes scope or a public interface, adds a dependency, deletes or migrates data, touches security or cost, or cannot be undone, ${ASK}. ${LATER}`
     case 'ask-blocking':
@@ -72,10 +94,19 @@ export const protocol = (root: string) => `## Conductor protocol
 - Progress: once you have a plan for the task, call \`${PROGRESS_TOOL}\` with \`steps\` (your 3 to 8 steps in order, a few words each) and \`done: 0\`. After finishing each step, call it again with \`done\` set to the number of steps finished; send \`steps\` again only if your plan changes.
 - Follow the decision policy in your task prompt; without one, decide routine choices yourself.
 - Your final answer, with nothing after it:
-  1. \`STATUS: done\`, \`STATUS: partial\` or \`STATUS: blocked\` (and when blocked on a question: \`NEEDS: <question>\`, optionally \`OPTIONS: a | b | c\`).
+  1. \`STATUS: done\`, \`STATUS: partial\` or \`STATUS: blocked\` (and when blocked on a question, put this block in the answer; 2 to 4 numbered options, each \`<n>. <short choice> — <what it means in practice>\`, the one you would pick marked \`(recommended)\`):
+\`\`\`
+${URGENT_EXAMPLE}
+\`\`\`
   2. A summary of at most 15 lines: what you did or found, the files you touched, what is left undone and why. No pasted code or logs unless the task asks.
   3. \`<decisions>\` ... \`</decisions>\`: choices you made yourself, one \`- \` line each with its reason; \`<decisions>none</decisions>\` when there were none.
-  4. \`<questions>\` ... \`</questions>\`: questions for the user that need no answer now, one \`- \` line each, \`question → what you assumed and went on with\`; \`<questions>none</questions>\` when there are none. Use \`NEEDS:\` only for what you cannot continue without.
+  4. \`<questions>\` ... \`</questions>\`: questions for the user that need no answer now, one group each in this form (\`WENT WITH\` is the number of the option you took), a blank line between questions; \`<questions>none</questions>\` when there are none. Use \`NEEDS:\` only for what you cannot continue without.
+\`\`\`
+<questions>
+${LATER_EXAMPLE}
+</questions>
+\`\`\`
+  Question rule (items 1 and 4): ${PLAIN}
   5. \`<knowledge>\` ... \`</knowledge>\`: durable facts later agents will need (where things live, conventions, commands, gotchas), one \`- \` bullet each ending with its source, e.g. \`(src: src/api/auth.ts)\`, that the knowledge base does not already hold; \`<knowledge>none</knowledge>\` when there are none.`
 
 export const footer = (root: string) => `\n\n---\n${protocol(root)}`
@@ -104,6 +135,7 @@ export const architectPrompt = (root: string) => `You are an architect: you desi
   - ids may be dotted for sub-tasks (\`T29.2.1\`); every id must be unique.
   - model: the cheapest that will succeed: \`haiku\` for mechanical or lookup work, \`sonnet\` for ordinary coding, \`opus\` only where the task needs deep reasoning. The conductor escalates a task that fails, so do not over-provision.
   - after: the ids that must finish first; leave it out when none, so tasks run in parallel. files: what it touches. verify: a command or check that proves it done.
+  - A decision the plan needs from the user is a question in the protocol's format, in plain language, with a recommended option.
   - A task that needs more than one line of detail gets \`${root}/${KDIR}/tasks/T<n>.md\` with a \`## Notes\` section; the conductor adds the rest.
 
 ${protocol(root)}`
@@ -113,7 +145,8 @@ export const verifierPrompt = (root: string) => `You are a verifier: you check o
 - Run the verify command when the brief has one; else check the done-criteria by reading the changed files.
 - Run commands the way the project documents them (\`${root}/${KDIR}/project.md\`, \`conventions.md\`: its interpreter, virtual environment, build tool). Do not assume \`python\`, \`node\` or another tool on PATH is the right one.
 - If the check cannot run for a reason outside the task (a missing interpreter, tool or path), answer \`VERDICT: inconclusive\` and say what was missing: that is not a fail.
-- Your final answer: \`VERDICT: pass\`, \`VERDICT: fail\` or \`VERDICT: inconclusive\`, then at most 8 lines: what you ran or read and, on fail, exactly what is wrong and where.`
+- Your final answer: \`VERDICT: pass\`, \`VERDICT: fail\` or \`VERDICT: inconclusive\`, then at most 8 lines: what you ran or read and, on fail, exactly what is wrong and where.
+- An \`inconclusive\` or \`fail\` reason the user may need to read says in plain words what is wrong or missing.`
 
 export const curatorPrompt = (root: string) => `You are the knowledge curator. You keep \`${root}/${KDIR}/\` small, accurate and easy to navigate for agents who read only what they need.
 - Put each fact where a reader would look for it: \`project.md\`, \`architecture.md\`, \`conventions.md\`, or a topic file such as \`modules/<area>.md\` once a subject outgrows its file. Keep each fact's \`(src: path)\` tag. Create a file only when no existing one fits.

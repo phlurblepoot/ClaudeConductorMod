@@ -5,11 +5,23 @@ A Claude Code mod that turns the main agent into a conductor. The main chat plan
 ## How a project runs
 
 1. **Plan.** Ask for something multi-step, or type `/conductor plan <goal>`. An architect writes `.knowledge/plan.md`: phases of tasks, each tagged with its agent, model, dependencies, files and a check, e.g. `- [ ] T4: PDF export {agent: builder, model: haiku, after: T3, files: src/pdf.ts, verify: npm test pdf}`. Ids may be dotted for sub-tasks (`T29.2.1`). A step for you or the main agent (an approval, a decision, a hands-on check) is tagged `agent: main`: runs never dispatch it, the pane marks it "for you / main agent", and the run's end note lists it.
-2. **Approve.** The agents pane shows **Plan ready for review**. You can change any task's agent or model with **edit tasks**, then **approve & run**. You approve a plan once: later edits to it (tasks added or fixed by the agents, same plan title) never stop a run for approval. Only a plan with a new title asks again.
+2. **Approve.** The Agents pane shows **Plan ready for review**. You can change any task's agent or model with **edit tasks**, then **approve & run**. You approve a plan once: later edits to it (tasks added or fixed by the agents, same plan title) never stop a run for approval. Only a plan with a new title asks again.
 3. **Run.** The conductor starts every task whose dependencies are done, up to 4 at a time. `run_plan` with task ids runs only those; called again with no ids, the run widens to the whole plan. A task ticked done (by an agent's report or by hand) stays done: no late report, verifier or retry reopens it, and only your **retry** does. It writes each task a **brief** (`.knowledge/tasks/T4.md`) holding the goal, files, done-criteria, relevant decisions and the results of the tasks it depends on. Agents read their brief instead of the conversation, and the main agent writes no per-task prompts.
 4. **Verify and escalate.** A tagged task is checked by a Haiku verifier, one at a time per task. Verifiers and builders run commands the way `.knowledge/project.md` documents them (its interpreter and tools). A check that cannot run for reasons outside the task (a missing tool or path) is **inconclusive**, not a fail. A task that fails, or fails its check, is retried one model up (Haiku, then Sonnet, then Opus), with what went wrong added to its brief. An agent stopped at twice its tool-call budget counts as a failed try; its brief records the calls, last step and files it touched, so the retry picks up from there. After three tries it's marked blocked.
-5. **Ask only when it matters.** Only an urgent question stops work, and only its own task; every other task keeps going. An urgent question is one the agent can't continue without, given your autonomy level. It goes into the pane's **Needs you** queue: answer it, pick an offered option, or **let AI decide**. The answer goes into the brief and `decisions.md`, and the task goes back in the queue.
-6. **Questions for later.** Anything else an agent wants your view on, it decides itself, notes what it assumed, and keeps going. Those questions collect in the pane's **For later** list. Answer when you like, keep the agent's assumption, or dismiss. An answer goes to `decisions.md` and the task's brief. If it differs from what the agent assumed, the main agent gets a note to add a follow-up task if finished work depends on it.
+5. **Ask only when it matters.** Only an urgent question stops work, and only its own task; every other task keeps going. An urgent question is one the agent can't continue without, given your autonomy level. It goes into the **Questions pane**'s **Needs you** queue, and the pane opens by itself (unless it is already open or you closed it). Answer it, pick an offered option, or **let AI decide**. The answer goes into the brief and `decisions.md`, and the task goes back in the queue.
+6. **Questions for later.** Anything else an agent wants your view on, it decides itself, notes what it assumed, and keeps going. Those questions collect in the Questions pane's **For later** list. Answer when you like, keep the agent's assumption, or dismiss. An answer goes to `decisions.md` and the task's brief. If it differs from what the agent assumed, the main agent gets a note to add a follow-up task if finished work depends on it.
+
+   **What agents write.** An urgent question is a `NEEDS:` line, an optional `WHY:` line and numbered options (the recommended one marked). A later question is a `Q:` line, an optional `WHY:` line, numbered options and `WENT WITH: <option number>`, one group per question inside the report's `<questions>` block:
+
+   ```
+   Q: Should old reports be kept after the upgrade?
+   WHY: They take space but cannot be rebuilt.
+   1. Keep them: nothing is lost, uses more disk space (recommended)
+   2. Delete them: saves space, cannot be undone
+   WENT WITH: 1
+   ```
+
+   **Plain language.** Every question is written for someone who is not an expert: plain words, what is being decided and what each choice changes in practice, any unavoidable term explained in a few words, and no ids, file paths or code unless you need them to answer. Each option is offered as a suggested answer you can pick with one click.
 7. **Finish.** The plan ticks itself. When the run ends, you get a chime and a toast, and the main agent gets a short note.
 
 ## What saves usage
@@ -30,7 +42,7 @@ A Claude Code mod that turns the main agent into a conductor. The main chat plan
 ## What you see
 
 - **Agents pane** (`/conductor pane`, or **agents** in the project bar) shows, from top to bottom:
-  - the Needs-you queue (urgent), the Couldn't start box, and the For later list (questions that block nothing);
+  - a one-line count of questions waiting with an **open questions** button (the questions themselves are in the Questions pane), and the Couldn't start box;
   - plan review;
   - a context bar with dots at the save and compact points;
   - run controls (pause, resume, stop);
@@ -40,7 +52,8 @@ A Claude Code mod that turns the main agent into a conductor. The main chat plan
   Runs open the pane only when it is not open already, and never again after you close it yourself; `/conductor pane` always opens it. When the window is too narrow to place it, the status line and the project bar say "pane hidden", with a **show agents** button. If the pane ever fails to draw, it shows the error and a **reset view** button instead of closing.
 
   Underneath are the autonomy picker, spend with the estimated savings versus using Opus for everything, and today against your budget. Buttons: expand all (`e`), edit tasks (`t`), checkpoint (`c`), compact (`k`), upkeep (`u`), report (`o`), clear finished (`x`).
-- **Project bar** above the prompt shows the plan's progress bar with a dot per task (or per phase), the run state, questions waiting, and agents working. Click it, or type `/conductor expand`, to see the current phase's tasks.
+- **Questions pane** (`/conductor questions`, or the questions chip in the project bar) holds the **Needs you** queue (urgent) and the **For later** list (questions that block nothing; **dismiss all** clears it without recording anything), each with the agent's why-line, its suggested options and a free-text answer. A new urgent question opens it by itself, and so does a chat that starts with urgent questions already waiting (questions for later alone do not), unless it is already open or you closed it.
+- **Project bar** above the prompt shows the plan's progress bar with a dot per task (or per phase), the run state, one questions chip (click it to open the Questions pane; it also shows when only later questions wait), and agents working. Click it, or type `/conductor expand`, to see the current phase's tasks.
 - **Welcome-back card**: in a new session, a line such as "12/20 done · blocked: T13 · next up: T14" with **run** and **dismiss** buttons.
 - **Bars** are SVG in the desktop app and text in the terminal (`━━━●━━╸◉───○`). Colours follow your theme.
 - **Progress report** (`/conductor report`) writes `.knowledge/report.md` and `report.html` from saved data. It makes no model calls.
@@ -68,6 +81,7 @@ A Claude Code mod that turns the main agent into a conductor. The main chat plan
 /conductor report              progress report, no model calls
 /conductor diag                pane diagnostics (draws, timing, errors, last tree, state) to .knowledge/session/pane-diag.json
 /conductor pane | band | expand
+/conductor questions           open the Questions pane
 /conductor mode enforce|guide|off
 /conductor checkpoint | compact | curate | init | route <task>
 ```

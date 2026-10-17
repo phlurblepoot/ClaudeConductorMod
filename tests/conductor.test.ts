@@ -19,6 +19,7 @@ import {
   setItemTag,
 } from '../hooks/plan'
 import { costOf, learnedTier, nextTier, recordOutcome, routeTask } from '../hooks/route'
+import { AUTONOMY_LEVELS, LATER_EXAMPLE, PLAIN, URGENT_EXAMPLE, architectPrompt, policyLine, protocol, runTaskPrompt, verifierPrompt } from '../hooks/prompts'
 import { spillNote, textOfResult } from '../hooks/spill'
 import { fromProgress, fromTodos, settleTasks, taskCreated, taskUpdated } from '../hooks/tasks'
 
@@ -308,13 +309,115 @@ describe('reports', () => {
     expect(extractStatus(REPORT)).toBe('done')
     expect(extractDecisions(REPORT)).toEqual(['Used zod for validation (it was already a dependency)'])
     expect(extractKnowledge(REPORT)).toBe('- Invoices live in src/api/invoices.ts (src: src/api/invoices.ts)')
-    expect(extractNeeds('STATUS: blocked\nNEEDS: Which database?\nOPTIONS: sqlite | postgres')).toEqual({ question: 'Which database?', options: ['sqlite', 'postgres'] })
+    expect(extractNeeds('STATUS: blocked\nNEEDS: Which database?\nOPTIONS: sqlite | postgres')).toEqual({
+      question: 'Which database?',
+      why: '',
+      options: ['sqlite', 'postgres'],
+      choices: [
+        { label: 'sqlite', detail: '', isRecommended: false },
+        { label: 'postgres', detail: '', isRecommended: false },
+      ],
+    })
     expect(extractNeeds(REPORT)).toBe(null)
     expect(extractQuestions('<questions>\n- Which date format? → ISO 8601\n- Tabs or spaces?\n</questions>')).toEqual([
-      { question: 'Which date format?', assumed: 'ISO 8601' },
-      { question: 'Tabs or spaces?', assumed: '' },
+      { question: 'Which date format?', assumed: 'ISO 8601', why: '', choices: [], chosen: null },
     ])
     expect(parseVerdict('VERDICT: fail\nThe test for totals fails.')).toEqual({ isPass: false, detail: 'The test for totals fails.' })
+  })
+
+  test('prose mentions of the questions tag never become questions', () => {
+    const report = (block: string) =>
+      [
+        'STATUS: done',
+        'Summary:',
+        '- Item 4 shows the fenced <questions> template in the prompt.',
+        '- options/WENT WITH: inside <questions> for later ones.',
+        '- tsc exits 0.',
+        '- Checks:',
+        '',
+        '<decisions>',
+        '- Kept the parser pure.',
+        '</decisions>',
+        block,
+      ].join('\n')
+    expect(extractQuestions(report('<questions>none</questions>'))).toEqual([])
+    expect(extractQuestions(report('<questions>\nNone\n</questions>'))).toEqual([])
+    expect(extractQuestions('Notes: see `<questions>` and WENT WITH: later.\n- tsc exits 0.\n<questions>none</questions>')).toEqual([])
+    const real = extractQuestions(
+      report('<questions>\nQ: Keep the old API?\nWHY: Callers may use it.\n1. Yes - nothing breaks (recommended)\n2. No - simpler code\nWENT WITH: 1\n</questions>'),
+    )
+    expect(real).toHaveLength(1)
+    expect(real[0]!.question).toBe('Keep the old API?')
+    expect(real[0]!.chosen).toBe(0)
+    expect(extractDecisions('See the <decisions> tag in prose.\n- not one\n<decisions>\n- real\n</decisions>')).toEqual(['real'])
+  })
+
+  test('reads the structured urgent question and the structured later questions', () => {
+    const n = extractNeeds(
+      'STATUS: blocked\nNEEDS: Which database should hold the data?\nWHY: The schema depends on it.\n1. SQLite — one file, no setup (recommended)\n2) Postgres: a server,\n   better for many users\n3. Both [Recommended]\n\nSummary text that is not part of the question.',
+    )
+    expect(n).toEqual({
+      question: 'Which database should hold the data?',
+      why: 'The schema depends on it.',
+      options: ['SQLite', 'Postgres', 'Both'],
+      choices: [
+        { label: 'SQLite', detail: 'one file, no setup', isRecommended: true },
+        { label: 'Postgres', detail: 'a server, better for many users', isRecommended: false },
+        { label: 'Both', detail: '', isRecommended: false },
+      ],
+    })
+    const bold = extractNeeds('STATUS: blocked\n**NEEDS:** Ship now?\n**Why:** The demo is tomorrow.\n- 1. Yes - ship (recommended)\n- 2. No - wait a week\nSTATUS: blocked')
+    expect(bold).toMatchObject({ question: 'Ship now?', why: 'The demo is tomorrow.', options: ['Yes', 'No'] })
+
+    const l = extractQuestions(
+      '<questions>\nQ: Keep dates as text?\nWHY: Sorting works either way.\n1. Text - simple (recommended)\n2. Real dates - stricter\nWENT WITH: Real dates\n\nq: Tabs or spaces?\nWhy: Only style.\n1. Tabs - one key\n2. Spaces -- what the repo uses (recommended)\nWent with: 2\nQ: Name the folder?\nWENT WITH: something else\n</questions>',
+    )
+    expect(l).toHaveLength(3)
+    expect(l[0]).toMatchObject({ question: 'Keep dates as text?', why: 'Sorting works either way.', assumed: 'Real dates', chosen: 1 })
+    expect(l[0]!.choices[0]).toEqual({ label: 'Text', detail: 'simple', isRecommended: true })
+    expect(l[1]).toMatchObject({ question: 'Tabs or spaces?', why: 'Only style.', assumed: 'Spaces', chosen: 1 })
+    expect(l[1]!.choices[1]).toEqual({ label: 'Spaces', detail: 'what the repo uses', isRecommended: true })
+    expect(l[2]).toEqual({ question: 'Name the folder?', assumed: 'something else', why: '', choices: [], chosen: null })
+  })
+
+  test('an urgent question needs a stopped report and a NEEDS: that begins its line', () => {
+    const t7 =
+      'STATUS: done\nThe questions reader now ignores prose mentions of the tag.\n\n- **hooks/notes.ts:** `extractQuestions` uses the last block.\n- NEEDS: extractNeeds was already line-anchored, so I left it alone.\n- Checks: tsc passes.'
+    expect(extractStatus(t7)).toBe('done')
+    expect(extractNeeds(t7)).toBe(null)
+    expect(extractNeeds('STATUS: done\nNEEDS: Which database?\nOPTIONS: a | b')).toBe(null)
+
+    expect(extractNeeds('STATUS: blocked\nNEEDS: Which database?\n1. SQLite (recommended)\n2. Postgres')).toMatchObject({
+      question: 'Which database?',
+      options: ['SQLite', 'Postgres'],
+    })
+    expect(extractNeeds('STATUS: blocked\n**NEEDS:** Ship now?\n1. Yes\n2. No')).toMatchObject({ question: 'Ship now?', options: ['Yes', 'No'] })
+    expect(extractNeeds('STATUS: blocked\n  needs: lower case works\n1. a\n2. b')).toMatchObject({ question: 'lower case works' })
+
+    expect(extractNeeds('STATUS: blocked\nThe build failed.\n- NEEDS: this is a bullet about code')).toBe(null)
+    expect(extractNeeds('STATUS: blocked\n1. NEEDS: numbered prose')).toBe(null)
+    expect(extractNeeds('STATUS: blocked\nIt NEEDS: a retry')).toBe(null)
+  })
+
+  test('keeps one recommended option, at most five, and reads a mixed later-questions block', () => {
+    const n = extractNeeds('NEEDS: Pick one\n1. a (recommended)\n2. b (recommended)\n3. c\n4. d\n5. e\n6. f')
+    expect(n?.choices.map(c => c.isRecommended)).toEqual([true, false, false, false, false])
+    expect(n?.options).toEqual(['a', 'b', 'c', 'd', 'e'])
+
+    const mixed = extractQuestions('<questions>\nQ: Keep the old API?\n1. Yes - nothing breaks (recommended)\n2. No - simpler code\nWENT WITH: yes\n\n- Which date format? → ISO 8601\n</questions>')
+    expect(mixed).toEqual([
+      {
+        question: 'Keep the old API?',
+        assumed: 'Yes',
+        why: '',
+        choices: [
+          { label: 'Yes', detail: 'nothing breaks', isRecommended: true },
+          { label: 'No', detail: 'simpler code', isRecommended: false },
+        ],
+        chosen: 0,
+      },
+      { question: 'Which date format?', assumed: 'ISO 8601', why: '', choices: [], chosen: null },
+    ])
   })
 
   test('strips the notes the inbox already holds', () => {
@@ -627,7 +730,7 @@ describe('hooks', () => {
       await clock.advance(100)
       expect(files['/proj/.knowledge/plan.md']).toContain('- [x] T1')
 
-      const ui = await $.ui.mount({ plugin: 'conductor', surface: 'terminal', component: 'Pane', requestId: 'conductor-agents', props: PANE })
+      const ui = await $.ui.mount({ plugin: 'conductor', surface: 'terminal', component: 'Pane', requestId: 'conductor-questions', props: PANE })
       expect(await ui.find({ type: 'Button', text: /For later \(1\)/ })).toBeDefined()
       expect(await ui.find({ type: 'Text', text: /went on assuming: ISO 8601/ })).toBeDefined()
       await ui.input({ key: 'la-l-ag-1-0', text: 'local format' })
@@ -638,7 +741,349 @@ describe('hooks', () => {
       expect(files['/proj/.knowledge/tasks/T1.md']).toContain('A: local format')
     })
 
-    test('a task ticked done while its agent ran stays done: a late report neither retries nor reopens it', OPTIONS, async ($, on) => {
+    const QPROPS = { ...PANE, title: 'Questions' }
+    const keysOf = (node: unknown, out: string[] = []): string[] => {
+      const n = node as { key?: string; children?: unknown[] }
+      if (n.key) out.push(n.key)
+      for (const c of n.children ?? []) keysOf(c, out)
+      return out
+    }
+    const questionsPane = ($: Engine, surface: 'terminal' | 'desktop' | 'mobile') =>
+      $.ui.mount({ plugin: 'conductor', surface, component: 'Pane', requestId: 'conductor-questions', props: QPROPS })
+
+    test('the Questions pane draws urgent and later questions with reasons, explanations and marks, on every surface', OPTIONS, async ($, on) => {
+      const clock = mock.clock(on, { now: Date.UTC(2026, 9, 15, 12) })
+      mock.store(on)
+      const { files, spawned } = project(on, '# Plan: Demo\n## Phase 1\n- [ ] T1: Write the parser {model: haiku}\n- [ ] T2: Write the printer {model: haiku}')
+      await $.command.run({ command: 'conductor', args: 'run' } as never)
+      await clock.advance(100)
+      expect(spawned.length).toBe(2)
+      await $.turn.complete({ turnId: 't1', agentId: 'ag-1', answer: `STATUS: blocked\n${URGENT_EXAMPLE}`, reason: 'answer', durationMs: 1, isAborted: false })
+      await $.turn.complete({
+        turnId: 't2',
+        agentId: 'ag-2',
+        answer: `STATUS: done\nPrinter written.\n<questions>\n${LATER_EXAMPLE}\n</questions>\n<knowledge>none</knowledge>`,
+        reason: 'answer',
+        durationMs: 1,
+        isAborted: false,
+      })
+      await clock.advance(100)
+
+      for (const surface of ['terminal', 'desktop', 'mobile'] as const) {
+        const ui = await questionsPane($, surface)
+        expect(await ui.find({ type: 'Text', text: /Needs you \(1\)/ })).toBeDefined()
+        expect(await ui.find({ type: 'Text', text: /Why it matters: Customers see these numbers/ })).toBeDefined()
+        expect(await ui.find({ type: 'Text', text: /prices look lower/ })).toBeDefined()
+        expect(await ui.find({ type: 'Text', text: 'recommended' })).toBeDefined()
+        expect(await ui.find({ type: 'Button', key: 'qo-q-ag-1-1' })).toBeDefined()
+        expect(await ui.find({ type: 'Button', text: 'let AI decide' })).toBeDefined()
+        expect(await ui.find({ type: 'Button', text: /For later \(2\)/ })).toBeDefined()
+        expect(await ui.find({ type: 'Text', text: 'the agent went with this' })).toBeDefined()
+        expect(await ui.find({ type: 'Text', text: /Why it matters: They take space/ })).toBeDefined()
+        expect(await ui.find({ type: 'Button', key: 'lo-l-ag-2-0-1' })).toBeDefined()
+        expect(await ui.find({ type: 'Button', text: 'keep what the agent chose' })).toBeDefined()
+        // Input exists only where the surface has it.
+        const input = await ui.find({ type: 'Input', key: 'qa-q-ag-1' })
+        if (surface === 'mobile') expect(input).toBeUndefined()
+        else expect(input).toBeDefined()
+        const keys = keysOf(await ui.drawn())
+        expect(new Set(keys).size).toBe(keys.length)
+        await ui.unmount()
+      }
+    })
+
+    test('pressing a Questions pane option records the answer; the agent\'s own pick on a later question is recorded as kept', OPTIONS, async ($, on) => {
+      const clock = mock.clock(on, { now: Date.UTC(2026, 9, 15, 12) })
+      mock.store(on)
+      const { files } = project(on, '# Plan: Demo\n## Phase 1\n- [ ] T1: Write the parser {model: haiku}\n- [ ] T2: Write the printer {model: haiku}')
+      await $.command.run({ command: 'conductor', args: 'run' } as never)
+      await clock.advance(100)
+      await $.turn.complete({ turnId: 't1', agentId: 'ag-1', answer: `STATUS: blocked\n${URGENT_EXAMPLE}`, reason: 'answer', durationMs: 1, isAborted: false })
+      await $.turn.complete({
+        turnId: 't2',
+        agentId: 'ag-2',
+        answer: `STATUS: done\nPrinter written.\n<questions>\n${LATER_EXAMPLE}\n</questions>\n<knowledge>none</knowledge>`,
+        reason: 'answer',
+        durationMs: 1,
+        isAborted: false,
+      })
+      await clock.advance(100)
+
+      const ui = await questionsPane($, 'terminal')
+      await ui.press({ key: 'qo-q-ag-1-1' })
+      await clock.advance(100)
+      expect(files['/proj/.knowledge/decisions.md']).toContain('→ Leave tax out')
+      expect(files['/proj/.knowledge/tasks/T1.md']).toContain('A: Leave tax out')
+      await ui.press({ key: 'lo-l-ag-2-0-1' })
+      await clock.advance(100)
+      expect(files['/proj/.knowledge/decisions.md']).toContain('Should old reports be kept after the upgrade? → Delete them')
+      // The first later question was the agent's own pick (option 1): pressing it keeps it.
+      await ui.press({ key: 'lo-l-ag-2-1-0' })
+      await clock.advance(100)
+      expect(files['/proj/.knowledge/decisions.md']).toContain('Which name should the new folder have? → reports-2026')
+      expect(files['/proj/.knowledge/decisions.md']).toContain("the user kept the agent's assumption")
+      expect(await ui.find({ type: 'Text', text: 'No questions right now.' })).toBeDefined()
+      await ui.unmount()
+    })
+
+    test('dismiss all empties the For later list without recording anything, on terminal and desktop', OPTIONS, async ($, on) => {
+      const clock = mock.clock(on, { now: Date.UTC(2026, 9, 15, 12) })
+      mock.store(on)
+      const { files } = project(on, '# Plan: Demo\n## Phase 1\n- [ ] T1: Write the parser {model: haiku}\n- [ ] T2: Write the printer {model: haiku}')
+      await $.command.run({ command: 'conductor', args: 'run' } as never)
+      await clock.advance(100)
+      await $.turn.complete({ turnId: 't1', agentId: 'ag-1', answer: `STATUS: done\nParser written.\n<questions>\n${LATER_EXAMPLE}\n</questions>\n<knowledge>none</knowledge>`, reason: 'answer', durationMs: 1, isAborted: false })
+      await clock.advance(100)
+      const before = files['/proj/.knowledge/decisions.md'] ?? ''
+      for (const surface of ['terminal', 'desktop'] as const) {
+        const ui = await questionsPane($, surface)
+        expect(await ui.find({ type: 'Button', key: 'ld-all', text: 'dismiss all' })).toBeDefined()
+        const keys = keysOf(await ui.drawn())
+        expect(new Set(keys).size).toBe(keys.length)
+        await ui.press({ key: 'ld-all' })
+        await clock.advance(100)
+        expect(await ui.find({ type: 'Button', text: /For later/ })).toBeUndefined()
+        expect(await ui.find({ type: 'Button', key: 'ld-all' })).toBeUndefined()
+        await ui.unmount()
+        expect(files['/proj/.knowledge/decisions.md'] ?? '').toBe(before)
+        if (surface === 'terminal') {
+          await $.turn.complete({ turnId: 't2', agentId: 'ag-2', answer: `STATUS: done\nPrinter written.\n<questions>\n${LATER_EXAMPLE}\n</questions>\n<knowledge>none</knowledge>`, reason: 'answer', durationMs: 1, isAborted: false })
+          await clock.advance(100)
+        }
+      }
+    })
+
+    test('one later question has no dismiss all button', OPTIONS, async ($, on) => {
+      const clock = mock.clock(on, { now: Date.UTC(2026, 9, 15, 12) })
+      mock.store(on)
+      project(on, '# Plan: Demo\n## Phase 1\n- [ ] T1: Write the parser {model: haiku}')
+      await $.command.run({ command: 'conductor', args: 'run' } as never)
+      await clock.advance(100)
+      await $.turn.complete({ turnId: 't1', agentId: 'ag-1', answer: 'STATUS: done\nParser written.\n<questions>\n- Should dates be ISO or local format? → ISO 8601\n</questions>\n<knowledge>none</knowledge>', reason: 'answer', durationMs: 1, isAborted: false })
+      await clock.advance(100)
+      const ui = await questionsPane($, 'terminal')
+      expect(await ui.find({ type: 'Button', text: /For later \(1\)/ })).toBeDefined()
+      expect(await ui.find({ type: 'Button', key: 'ld-all' })).toBeUndefined()
+      await ui.unmount()
+    })
+
+    test('stored later questions with no choices, no assumption and no question mark are dropped at session start', OPTIONS, async ($, on) => {
+      mock.clock(on, { now: Date.UTC(2026, 9, 15, 12) })
+      mock.store(on)
+      on('session.start', () => ({ cwd: '/proj' }) as never)
+      on('command.register', () => ({ value: true }) as never)
+      on('agent.register', () => ({ value: true }) as never)
+      on('tool.register', () => ({ value: true }) as never)
+      let seeded = false
+      on('state.get', async (_, e, next) => {
+        const r = await next(e)
+        if (e.key !== 'laterQuestions' || seeded) return r
+        seeded = true
+        const mk = (id: string, question: string, extra: object) => ({ id, question, from: 'ag-1', itemId: null, ...extra })
+        return { value: { ...(r.value ?? {}), value: [mk('j1', 'NEEDS: left alone', {}), mk('k1', 'Keep me?', {}), mk('k2', 'with a pick', { assumed: 'x' }), mk('k3', 'with choices', { choices: [{ label: 'a', detail: '', isRecommended: false }] })] } } as never
+      })
+      project(on, '# Plan: Demo\n## Phase 1\n- [ ] T1: Write the parser {model: haiku}')
+      await ($.session as unknown as { start: (e: object) => Promise<unknown> }).start({ cwd: '/proj' })
+      const ui = await questionsPane($, 'terminal')
+      expect(await ui.find({ type: 'Button', text: /For later \(3\)/ })).toBeDefined()
+      await ui.unmount()
+    })
+
+    describe('session start opens the Questions pane', () => {
+      const seedAndStart = async ($: any, on: On, key: string, list: object[]) => {
+        mock.clock(on, { now: Date.UTC(2026, 9, 15, 12) })
+        mock.store(on)
+        const { opened } = fakePanes(on)
+        on('session.start', () => ({ cwd: '/proj' }) as never)
+        on('command.register', () => ({ value: true }) as never)
+        on('agent.register', () => ({ value: true }) as never)
+        on('tool.register', () => ({ value: true }) as never)
+        let seeded = false
+        on('state.get', async (_, e, next) => {
+          const r = await next(e)
+          if (e.key !== key || seeded) return r
+          seeded = true
+          return { value: { ...(r.value ?? {}), value: list } } as never
+        })
+        project(on, '# Plan: Demo\n## Phase 1\n- [ ] T1: Write the parser {model: haiku}')
+        await ($.session as unknown as { start: (e: object) => Promise<unknown> }).start({ cwd: '/proj' })
+        return opened
+      }
+      const mk = (id: string) => ({ id, question: 'Which flag parser?', from: 'ag-1', itemId: null, choices: [{ label: 'a', detail: '', isRecommended: false }] })
+
+      test('an urgent question already waiting opens it', { options: { showPane: true, classifier: false, sound: false } }, async ($, on) => {
+        const opened = await seedAndStart($, on, 'questions', [mk('u1')])
+        expect(opened).toContain('conductor-questions')
+      })
+      test('only later questions open nothing', { options: { showPane: true, classifier: false, sound: false } }, async ($, on) => {
+        const opened = await seedAndStart($, on, 'laterQuestions', [mk('l1')])
+        expect(opened).not.toContain('conductor-questions')
+      })
+      test('no questions open nothing', { options: { showPane: true, classifier: false, sound: false } }, async ($, on) => {
+        const opened = await seedAndStart($, on, 'none', [])
+        expect(opened).not.toContain('conductor-questions')
+      })
+    })
+
+    test('the Questions pane still draws questions in the old format', OPTIONS, async ($, on) => {
+      const clock = mock.clock(on, { now: Date.UTC(2026, 9, 15, 12) })
+      mock.store(on)
+      const { spawned } = project(on, '# Plan: Demo\n## Phase 1\n- [ ] T1: Write the parser {model: haiku}\n- [ ] T2: Write the printer {model: haiku}')
+      await $.command.run({ command: 'conductor', args: 'run' } as never)
+      await clock.advance(100)
+      expect(spawned.length).toBe(2)
+      await $.turn.complete({ turnId: 't1', agentId: 'ag-1', answer: 'STATUS: blocked\nNEEDS: Which flag parser should the CLI use?\nOPTIONS: yargs | commander', reason: 'answer', durationMs: 1, isAborted: false })
+      await $.turn.complete({
+        turnId: 't2',
+        agentId: 'ag-2',
+        answer: 'STATUS: done\nPrinter written.\n<questions>\n- Should dates be ISO or local format? → ISO 8601\n</questions>\n<knowledge>none</knowledge>',
+        reason: 'answer',
+        durationMs: 1,
+        isAborted: false,
+      })
+      await clock.advance(100)
+      for (const surface of ['terminal', 'desktop', 'mobile'] as const) {
+        const ui = await questionsPane($, surface)
+        expect(await ui.find({ type: 'Button', key: 'qo-q-ag-1-1', text: 'commander' })).toBeDefined()
+        expect(await ui.find({ type: 'Text', text: /Why it matters/ })).toBeUndefined()
+        expect(await ui.find({ type: 'Text', text: /went on assuming: ISO 8601/ })).toBeDefined()
+        expect(await ui.find({ type: 'Button', key: 'lk-l-ag-2-0' })).toBeDefined()
+        const keys = keysOf(await ui.drawn())
+        expect(new Set(keys).size).toBe(keys.length)
+        await ui.unmount()
+      }
+    })
+
+    test('/conductor questions opens the Questions pane', OPTIONS, async ($, on) => {
+      mock.clock(on, { now: Date.UTC(2026, 9, 15, 12) })
+      mock.store(on)
+      on('session.root', () => ({ value: '/proj' }))
+      memFs(on, {})
+      const r = await $.command.run({ command: 'conductor', args: 'questions' } as never)
+      expect(JSON.stringify(r)).toMatch(/Questions pane (opened|is waiting)/)
+    })
+
+    const SHOW = { options: { showPane: true, classifier: false, sound: false } }
+    const BAR = { hasSurvey: false, isWorking: true, maxRows: 10, bodyColumns: 100, scroll: { offset: 0, bodyRows: 9 }, view: {} }
+    /** Stands in for the surface's pane placing: records opens, lists what is open, placed everywhere. */
+    function fakePanes(on: On) {
+      const open: string[] = []
+      const opened: string[] = []
+      on('ui.open', (_, e) => {
+        opened.push(e.id)
+        if (!open.includes(e.id)) open.push(e.id)
+        return { value: { isPlaced: true as const } } as never
+      })
+      on('ui.panes', () => ({ value: open.map(id => ({ id, title: id, isShown: true, isFocused: false, isPlaced: true })) }) as never)
+      return { open, opened }
+    }
+
+    test('the Agents pane keeps no question sections: one line with the counts and a button that opens the Questions pane', OPTIONS, async ($, on) => {
+      const clock = mock.clock(on, { now: Date.UTC(2026, 9, 15, 12) })
+      mock.store(on)
+      const { opened } = fakePanes(on)
+      const { spawned } = project(on, '# Plan: Demo\n## Phase 1\n- [ ] T1: Write the parser {model: haiku}\n- [ ] T2: Write the printer {model: haiku}')
+      await $.command.run({ command: 'conductor', args: 'run' } as never)
+      await clock.advance(100)
+      expect(spawned.length).toBe(2)
+      await $.turn.complete({ turnId: 't1', agentId: 'ag-1', answer: `STATUS: blocked\n${URGENT_EXAMPLE}`, reason: 'answer', durationMs: 1, isAborted: false })
+      await $.turn.complete({ turnId: 't2', agentId: 'ag-2', answer: `STATUS: done\nPrinter written.\n<questions>\n${LATER_EXAMPLE}\n</questions>\n<knowledge>none</knowledge>`, reason: 'answer', durationMs: 1, isAborted: false })
+      await clock.advance(100)
+
+      for (const surface of ['terminal', 'desktop', 'mobile'] as const) {
+        const ui = await $.ui.mount({ plugin: 'conductor', surface, component: 'Pane', requestId: 'conductor-agents', props: PANE })
+        expect(await ui.find({ type: 'Text', text: /Needs you/ })).toBeUndefined()
+        expect(await ui.find({ type: 'Button', text: /For later/ })).toBeUndefined()
+        expect(await ui.find({ type: 'Button', text: 'let AI decide' })).toBeUndefined()
+        expect(await ui.find({ type: 'Text', text: 'Questions: 1 need you · 2 for later' })).toBeDefined()
+        expect(await ui.find({ type: 'Button', key: 'open-questions' })).toBeDefined()
+        const keys = keysOf(await ui.drawn())
+        expect(new Set(keys).size).toBe(keys.length)
+        opened.length = 0
+        await ui.press({ key: 'open-questions' })
+        await clock.advance(100)
+        expect(opened).toEqual(['conductor-questions'])
+        await ui.unmount()
+      }
+    })
+
+    test('the project bar shows one questions chip, also when only a later question exists, and it opens the Questions pane', OPTIONS, async ($, on) => {
+      const clock = mock.clock(on, { now: Date.UTC(2026, 9, 15, 12) })
+      mock.store(on)
+      const { opened } = fakePanes(on)
+      on('turn.complete', (_, e) => ({ text: e.answer }))
+      on('ui.render', (engine, e) => engine.ui.resolve(e).Box({}))
+      on('session.root', () => ({ value: '/proj' }))
+      on('agent.spawn', (_, e) => ({ model: e.model ?? 'claude-sonnet-5-5', agentId: 'agent-1' }))
+      await $.agent.spawn({ ...SPAWN, tool_use_id: 't1', subagentType: 'conductor:builder', description: 'Add export', prompt: 'Implement the export\nPlan item: none' })
+      await $.turn.complete({
+        turnId: 't1',
+        agentId: 'agent-1',
+        answer: 'STATUS: done\nExport added.\n<questions>\n- Should dates be ISO or local format? → ISO 8601\n</questions>\n<knowledge>none</knowledge>',
+        reason: 'answer',
+        durationMs: 1,
+        isAborted: false,
+      })
+      await clock.advance(100)
+      for (const surface of ['terminal', 'desktop'] as const) {
+        const band = await $.ui.mount({ plugin: 'conductor', surface, component: 'AbovePrompt', props: BAR })
+        expect(await band.find({ type: 'Button', key: 'questions-chip', text: '1 for later' })).toBeDefined()
+        expect(await band.find({ type: 'Text', text: /need you/ })).toBeUndefined()
+        opened.length = 0
+        await band.press({ key: 'questions-chip' })
+        await clock.advance(100)
+        expect(opened).toEqual(['conductor-questions'])
+        await band.unmount()
+      }
+    })
+
+    test('a new urgent question opens the Questions pane (not the Agents pane) unasked, once, and not again after the person closed it', SHOW, async ($, on) => {
+      const clock = mock.clock(on, { now: Date.UTC(2026, 9, 15, 12) })
+      mock.store(on)
+      const { open, opened } = fakePanes(on)
+      let closedByPerson = false
+      on('state.get', async (_, e, next) => {
+        const r = await next(e)
+        if (!closedByPerson || e.key !== 'questionsPane' || !r.value) return r
+        return { value: { ...r.value, value: { ...((r.value.value ?? { waiting: null }) as object), isClosedByPerson: true } } }
+      })
+      const { spawned } = project(on, '# Plan: Demo\n## Phase 1\n- [ ] T1: Write the parser {model: haiku}\n- [ ] T2: Write the printer {model: haiku}\n- [ ] T3: Write the tests {model: haiku}\n- [ ] T4: Write the logger {model: haiku}')
+      await $.command.run({ command: 'conductor', args: 'run' } as never)
+      await clock.advance(100)
+      expect(spawned.length).toBe(4)
+      opened.length = 0
+      await $.turn.complete({ turnId: 't1', agentId: 'ag-1', answer: `STATUS: blocked\n${URGENT_EXAMPLE}`, reason: 'answer', durationMs: 1, isAborted: false })
+      await clock.advance(100)
+      expect(opened).toContain('conductor-questions')
+      expect(opened).not.toContain('conductor-agents')
+      // Already open: a second urgent question does not ask again.
+      opened.length = 0
+      await $.turn.complete({ turnId: 't2', agentId: 'ag-2', answer: 'STATUS: blocked\nNEEDS: Which flag parser should the CLI use?\nOPTIONS: yargs | commander', reason: 'answer', durationMs: 1, isAborted: false })
+      await clock.advance(100)
+      expect(opened).not.toContain('conductor-questions')
+      // Closed, but not by the person: the next urgent question opens it again.
+      open.splice(open.indexOf('conductor-questions'), 1)
+      opened.length = 0
+      await $.turn.complete({ turnId: 't3', agentId: 'ag-3', answer: 'STATUS: blocked\nNEEDS: Which test runner should the tests use?\nOPTIONS: vitest | jest', reason: 'answer', durationMs: 1, isAborted: false })
+      await clock.advance(100)
+      expect(opened).toContain('conductor-questions')
+      // Closed by the person: the next urgent question leaves it closed. The test kit cannot raise a
+      // ui.close with origin person, so the pane's stored state reads as the ui.close hook leaves it.
+      open.splice(open.indexOf('conductor-questions'), 1)
+      closedByPerson = true
+      opened.length = 0
+      await $.turn.complete({ turnId: 't4', agentId: 'ag-4', answer: 'STATUS: blocked\nNEEDS: Which logger should the CLI use?\nOPTIONS: pino | winston', reason: 'answer', durationMs: 1, isAborted: false })
+      await clock.advance(100)
+      expect(opened).not.toContain('conductor-questions')
+      expect(opened).not.toContain('conductor-agents')
+      // Asked, it opens again.
+      closedByPerson = false
+      await $.command.run({ command: 'conductor', args: 'questions' } as never)
+      await clock.advance(100)
+      expect(opened).toContain('conductor-questions')
+    })
+
+    test('a task ticked done while its agent ran stays done: a late report neither retries nor reopens it',OPTIONS, async ($, on) => {
       const clock = mock.clock(on, { now: Date.UTC(2026, 9, 15, 12) })
       mock.store(on)
       const { files, spawned } = project(on, '# Plan: Demo\n## Phase 1\n- [ ] T1: First {model: sonnet}')
@@ -825,10 +1270,10 @@ describe('hooks', () => {
     await finish('ag-3', 'STATUS: blocked\nNEEDS: Which flag parser should the CLI use?\nOPTIONS: yargs | commander')
     await clock.advance(500)
     expect(files['/proj/.knowledge/plan.md']).toContain('- [!] T2')
-    const onDesktop = await $.ui.mount({ plugin: 'conductor', surface: 'desktop', component: 'Pane', requestId: 'conductor-agents', props: PANE })
+    const onDesktop = await $.ui.mount({ plugin: 'conductor', surface: 'desktop', component: 'Pane', requestId: 'conductor-questions', props: PANE })
     expect(await onDesktop.find({ type: 'Button', text: 'let AI decide' })).toBeDefined()
     await onDesktop.unmount()
-    const pane = await $.ui.mount({ plugin: 'conductor', surface: 'terminal', component: 'Pane', requestId: 'conductor-agents', props: PANE })
+    const pane = await $.ui.mount({ plugin: 'conductor', surface: 'terminal', component: 'Pane', requestId: 'conductor-questions', props: PANE })
     expect(await pane.find({ type: 'Text', text: /Needs you \(1\)/ })).toBeDefined()
     await pane.press({ key: 'qo-q-ag-3-0' })
     await clock.advance(500)
@@ -856,5 +1301,38 @@ describe('hooks', () => {
     const text = JSON.stringify((kept as { message?: unknown }).message)
     expect(text).toContain('FINAL: 3 tests failed')
     expect(text.length).toBeLessThan(5000)
+  })
+})
+
+describe('prompts', () => {
+  const count = (text: string, part: string) => text.split(part).length - 1
+  const item = { id: 'T1', text: 'Do it', agent: null, model: null, effort: null, after: [], files: [], verify: null } as never
+
+  test('the protocol examples parse into structured questions', () => {
+    const p = protocol('/p')
+    expect(p).toContain(URGENT_EXAMPLE)
+    expect(p).toContain(LATER_EXAMPLE)
+    const n = extractNeeds(`STATUS: blocked\n${URGENT_EXAMPLE}`)
+    expect(n?.question).toBe('Should the report show prices with tax included?')
+    expect(n?.why).not.toBe('')
+    expect(n?.choices).toHaveLength(2)
+    expect(n?.choices.map(c => c.isRecommended)).toEqual([true, false])
+    expect(n?.choices.every(c => c.detail !== '')).toBe(true)
+    const l = extractQuestions(`<questions>\n${LATER_EXAMPLE}\n</questions>`)
+    expect(l).toHaveLength(2)
+    for (const q of l) {
+      expect(q.why).not.toBe('')
+      expect(q.choices).toHaveLength(2)
+      expect(q.choices.filter(c => c.isRecommended)).toHaveLength(1)
+      expect(q.chosen).toBe(0)
+    }
+  })
+
+  test('the plain-language rule reaches every prompt that asks, once', () => {
+    expect(count(protocol('/p'), PLAIN)).toBe(1)
+    for (const level of AUTONOMY_LEVELS) expect(count(policyLine(level), PLAIN)).toBe(1)
+    expect(count(runTaskPrompt(item, 'b.md', 1, policyLine('ask-important')), PLAIN)).toBe(1)
+    expect(architectPrompt('/p')).toMatch(/plain language/)
+    expect(verifierPrompt('/p')).toMatch(/plain words/)
   })
 })
