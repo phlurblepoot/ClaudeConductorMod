@@ -70,7 +70,7 @@ export function textBar(frac: number, width: number, marks: readonly Mark[] = []
 export const SVG_FILL = {
   plan: '#3FB950',
   agent: '#4C8DF6',
-  estimate: '#8B949E',
+  estimate: '#8FB4F8',
   ok: '#3FB950',
   warn: '#D29922',
   full: '#E5534B',

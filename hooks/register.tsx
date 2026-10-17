@@ -6,21 +6,25 @@ import type {
   ConductorAgentStatus,
   ConductorChoice,
   ConductorContext,
+  ConductorCostHistory,
+  ConductorLaterQuestion,
   ConductorEffort,
   ConductorMode,
   ConductorPlan,
+  ConductorHold,
   ConductorPlanItem,
   ConductorQuestion,
   ConductorRole,
   ConductorRun,
   ConductorTask,
   ConductorTier,
+  ConductorUsageRatio,
 } from '../types'
 import { marksOf, svgBar, SVG_FILL } from './bar'
 import type { Mark } from './bar'
 import { briefPath, decisionsExcerpt, getSection, parseVerdict, recordResult, renderBrief, setSection, summarize } from './briefs'
 import type { DepResult } from './briefs'
-import { DOT, DOT_TONE, STATUS_DOT, STATUS_TONE, cleanText, cleanTree, drawBar, uniqueKeys, hasInput, ink, pctOf, planItemText, taskRow } from './draw'
+import { DOT, DOT_TONE, STATUS_DOT, STATUS_TONE, cleanText, cleanTree, drawBar, progressKind, uniqueKeys, hasInput, ink, pctOf, planItemText, taskRow } from './draw'
 import type { Table } from './draw'
 import type { BarKind } from './draw'
 import { describeCall, extractDecisions, extractKnowledge, extractNeeds, extractQuestions, extractStatus, stripTagged } from './notes'
@@ -60,6 +64,8 @@ import {
   toolBudgetFor,
 } from './route'
 import type { TokenUsage } from './route'
+import { checkRoom, estimateCost, learnRatio, recordCost, whenText } from './usage'
+import type { Estimate, Room, UsageSample, Window } from './usage'
 import { spillName, spillNote, textOfResult } from './spill'
 import { clipText, countTasks, fracOf, fromProgress, fromTodos, settleTasks, taskCreated, taskUpdated } from './tasks'
 
@@ -103,6 +109,7 @@ const welcomeA = atom({ plugin: 'conductor', key: 'welcome' } as const, null)
 const todayA = atom({ plugin: 'conductor', key: 'today' } as const, { day: '', usd: 0, isWrappingUp: false })
 const budgetA = atom({ plugin: 'conductor', key: 'budgetUsd' } as const, null)
 const launchIssuesA = atom({ plugin: 'conductor', key: 'launchIssues' } as const, {})
+const heldA = atom({ plugin: 'conductor', key: 'held' } as const, {})
 const laterQuestionsA = atom({ plugin: 'conductor', key: 'laterQuestions' } as const, [])
 const paneStateA = atom({ plugin: 'conductor', key: 'pane' } as const, { isClosedByPerson: false, waiting: null })
 const questionsPaneA = atom({ plugin: 'conductor', key: 'questionsPane' } as const, { isClosedByPerson: false, waiting: null })
@@ -121,6 +128,8 @@ const INBOX_HEADER = '# Inbox\n\nRaw notes from subagents, waiting for the curat
 /** Tool calls a typical run of each tier makes, for the estimated bar when an agent reports no steps. */
 const EXPECTED_CALLS: Record<string, number> = { haiku: 10, sonnet: 25, opus: 35, fable: 35 }
 const MAX_ATTEMPTS = 3
+/** How many finished agents the agents pane keeps. */
+const KEEP_FINISHED = 5
 
 // ---------------------------------------------------------------- config
 
@@ -355,6 +364,15 @@ let costBase: { day: string; usd: number } | null = null
 type DispatchMeta = { role: ConductorRole; type: string; reason: string; kind: string; attempt: number; effort: ConductorEffort | null; planItem: string | null }
 /** What the conductor knows about a spawn it is about to make, by the spawn's description. */
 const dispatchMeta = new Map<string, DispatchMeta>()
+/** Recent agent costs and window points per dollar: learned, saved in the store, never drawn. */
+let costHistory: ConductorCostHistory = {}
+let usageRatio: ConductorUsageRatio = {}
+let lastWindows: Window[] = []
+let lastUsageSample: UsageSample | null = null
+/** Estimates of work started and not finished, by launch key until the launch has an agent id, then by agent id. */
+const reservedUsd = new Map<string, number>()
+let holdTimer: { cancel: () => void } | null = null
+let holdTimerAt = 0
 
 async function modeOf($: $): Promise<ConductorMode> {
   return (await read($, modeA)) ?? cfg.delegation
@@ -372,10 +390,10 @@ function updateAgent($: $, id: string, fn: (a: ConductorAgent) => ConductorAgent
   return update($, agentsA, list => list.map(a => (a.id === id ? fn(a) : a)))
 }
 
-/** Keeps every running agent and the 12 most recently finished. */
+/** Keeps every running agent and the KEEP_FINISHED (5) most recently finished. */
 function prune(list: ConductorAgent[]) {
   const finished = list.filter(a => a.status !== 'running').sort((a, b) => (b.endedAt ?? 0) - (a.endedAt ?? 0))
-  const keep = new Set(finished.slice(0, 12).map(a => a.id))
+  const keep = new Set(finished.slice(0, KEEP_FINISHED).map(a => a.id))
 
   return list.filter(a => a.status === 'running' || keep.has(a.id))
 }
@@ -652,6 +670,17 @@ function notify($: $, text: string, isLoud: boolean) {
   if (isLoud && cfg.sound) $.audio.play({ asset: CHIME }).catch(() => undefined)
 }
 
+/** Held work in the order it is shown: task holds in plan order, then the checks, each with a plain label. */
+function holdList(held: Record<string, ConductorHold>, items: ConductorPlanItem[]) {
+  const pos = (key: string) => {
+    const i = items.findIndex(x => x.id === key.replace(/^verify:/, ''))
+    return i < 0 ? items.length : i
+  }
+  return Object.keys(held)
+    .sort((a, b) => Number(a.startsWith('verify:')) - Number(b.startsWith('verify:')) || pos(a) - pos(b))
+    .map(key => ({ key, label: key.startsWith('verify:') ? `the check of ${key.slice(7)}` : key, hold: held[key]! }))
+}
+
 async function refreshStatus($: $) {
   if ((await modeOf($)) === 'off') return $.ui.status(undefined)
   const ctx = await read($, contextA)
@@ -671,6 +700,8 @@ async function refreshStatus($: $) {
   if ((await read($, questionsPaneA)).waiting) parts.push('questions pane hidden: /conductor questions')
   const issues = Object.keys(await read($, launchIssuesA)).length
   if (issues) parts.push(`${issues} couldn't start`)
+  const holds = Object.keys(await read($, heldA)).length
+  if (holds) parts.push(`${holds} waiting for usage`)
   $.ui.status(parts.join(' · '))
 }
 
@@ -813,6 +844,66 @@ async function staleFacts($: $, changed: readonly string[]): Promise<string[]> {
   return out
 }
 
+/** What is left to spend: the daily budget, today's spend, work already started, and the rate-limit windows. */
+async function roomNow($: $): Promise<Room> {
+  const now = await $.clock.now()
+  const today = await read($, todayA)
+  let reserved = 0
+  for (const v of reservedUsd.values()) reserved += v
+
+  return { budgetUsd: await budgetOf($), usedUsd: today.day === dayOf(now) ? today.usd : 0, reservedUsd: reserved, windows: lastWindows, ratio: usageRatio, now }
+}
+
+/** Holds work that does not fit in the usage left: the reason is toasted and written to its brief. True when held. */
+async function holdIfNoRoom($: $, key: string, label: string, est: Estimate, meta: { tier: ConductorTier; choiceReason: string; kind: string; attempt: number }): Promise<boolean> {
+  const room = await roomNow($)
+  const fit = checkRoom(est.usd, room)
+  const prev = (await read($, heldA))[key]
+  if (fit.fits) {
+    if (prev) await update($, heldA, m => without(m, key))
+    return false
+  }
+  await update($, heldA, m => ({ ...m, [key]: { reason: fit.reason, short: fit.short, retryAt: fit.retryAt, estimateUsd: est.usd, ...meta, at: room.now } }))
+  if (!prev || prev.short !== fit.short) {
+    notify($, `${label} waits for usage: ${fit.reason}`, false)
+    if (!key.startsWith('verify:')) await editBrief($, key, doc => setSection(doc, 'Waiting for usage', `${iso(room.now)} · ${meta.tier} · ${fit.reason}`))
+  }
+  await scheduleHoldWake($)
+  await refreshStatus($)
+
+  return true
+}
+
+/** Sets one timer for the earliest time room should return (a window reset or midnight). */
+async function scheduleHoldWake($: $) {
+  const held = await read($, heldA)
+  const times = Object.values(held).map(h => h.retryAt).filter((t): t is number => typeof t === 'number')
+  if (!times.length) {
+    holdTimer?.cancel()
+    holdTimer = null
+    holdTimerAt = 0
+    return
+  }
+  const at = Math.min(...times)
+  if (holdTimer && holdTimerAt <= at) return
+  holdTimer?.cancel()
+  const now = await $.clock.now()
+  holdTimerAt = at
+  holdTimer = $.clock.after(Math.max(1000, at - now + 30_000), () => {
+    holdTimer = null
+    holdTimerAt = 0
+    requestPump($)
+  })
+}
+
+/** Pumps when a held piece of work now fits. */
+async function pumpIfRoom($: $) {
+  const held = Object.values(await read($, heldA))
+  if (!held.length) return
+  const room = await roomNow($)
+  if (held.some(h => checkRoom(h.estimateUsd, room).fits)) requestPump($)
+}
+
 async function maybeUpkeep($: $, isForced = false): Promise<string> {
   const cur = await read($, curationA)
   if (cur) {
@@ -829,15 +920,21 @@ async function maybeUpkeep($: $, isForced = false): Promise<string> {
   const isDue = noteCount >= cfg.curateEvery || dirty.length >= cfg.mapEvery || (isForced && (noteCount > 0 || dirty.length > 0))
   if (!isDue) return `${plural(noteCount, 'note')} and ${plural(dirty.length, 'changed file')} waiting; upkeep runs at ${cfg.curateEvery} notes or ${cfg.mapEvery} files.`
   if (isUpkeepLaunching) return 'Knowledge upkeep is starting.'
+  const upkeepEst = estimateCost(costHistory, 'curator', 'curator', 'haiku')
+  const upkeepFit = checkRoom(upkeepEst.usd, await roomNow($))
+  if (!upkeepFit.fits) return `Knowledge upkeep waits for usage: ${upkeepFit.reason}`
   const stale = await staleFacts($, dirty)
   isUpkeepLaunching = true
+  reservedUsd.set('upkeep', upkeepEst.usd)
   await launchThen($, { subagentType: 'conductor:curator', description: 'Knowledge upkeep', prompt: P.upkeepTask({ notes, changed: dirty, stale }), model: 'haiku' }, async l => {
     isUpkeepLaunching = false
     const agentId = l.agentId
+    reservedUsd.delete('upkeep')
     if (agentId === undefined) {
       notify($, `knowledge upkeep did not start: ${l.deny}`, false)
       return
     }
+    reservedUsd.set(agentId, upkeepEst.usd)
     await update($, curationA, () => ({ agentId, length: text.length, files: dirty }))
   })
 
@@ -1117,30 +1214,15 @@ async function checkBudget($: $) {
   const today = await read($, todayA)
   const pct = (today.usd / budget) * 100
   if (pct >= cfg.budgetWrapUpPercent && !today.isWrappingUp) await wrapUp($, pct, budget)
-  const run = await read($, runA)
-  if (pct >= 100 && run?.isActive && !run.isPaused) {
-    await update($, runA, r => (r ? { ...r, isPaused: true } : r))
-    notify($, `daily budget reached (${usd(today.usd)} of ${usd(budget)}): the plan run is paused.`, true)
-  }
 }
 
-/** Near the daily budget: no new tasks, running agents told to finish their step, the main agent told to wind down. */
+/** Near the daily budget: the main agent is told to wind down; running agents finish, and the plan run starts a task only when its estimate fits. */
 async function wrapUp($: $, pct: number, budget: number) {
   await update($, todayA, t => ({ ...t, isWrappingUp: true }))
-  notify($, `daily budget at ${Math.round(pct)}% of ${usd(budget)}: finishing current work, starting nothing new.`, true)
-  for (const a of (await read($, agentsA)).filter(x => x.status === 'running' && x.role !== 'upkeep')) {
-    try {
-      await $.session.send({
-        to: { agentId: a.id },
-        text: 'The daily usage budget is nearly used. Finish the step you are on, then give your final report now (STATUS: partial if the task is unfinished, saying what is left).',
-      })
-    } catch {
-      // it may have just finished
-    }
-  }
+  notify($, `daily budget at ${Math.round(pct)}% of ${usd(budget)}: running agents finish; a new task starts only when enough budget is left for it.`, true)
   await tellMain(
     $,
-    `The daily usage budget is ${Math.round(pct)}% used. Wrap up: start no new work, let running agents finish, and tell the user where things stand and what is next. The plan run starts nothing new until tomorrow or until the user raises the budget.`,
+    `The daily usage budget is ${Math.round(pct)}% used. Wrap up your own work: start nothing big, let running agents finish, and tell the user where things stand. The plan run starts a task only when enough of the budget is left for it.`,
   )
   later($, () => checkpoint($, 'daily budget'), 500)
 }
@@ -1156,6 +1238,7 @@ async function addQuestion($: $, q: ConductorQuestion) {
 
 /** The person's answer to a question: written to the brief and decisions, the task back in the queue. */
 async function answerQuestion($: $, qid: string, answer: string, how: 'user' | 'delegate' | 'dismiss') {
+  drafts.delete(`qa-${qid}`)
   const q = (await read($, questionsA)).find(x => x.id === qid)
   if (!q) return
   await update($, questionsA, list => list.filter(x => x.id !== qid))
@@ -1189,6 +1272,12 @@ async function answerQuestion($: $, qid: string, answer: string, how: 'user' | '
 
 // ---------------------------------------------------------------- questions for later
 
+/** Who asked, for the Questions pane header: `builder · sonnet`. */
+function agentLabel(row: ConductorAgent): string {
+  const kind = String(row.type ?? '').replace(/^conductor:/, '')
+  return kind ? `${kind} · ${row.model}` : String(row.model ?? '')
+}
+
 /** Questions an agent left without stopping: listed in the pane, answered whenever the person likes. */
 async function addLaterQuestions($: $, row: ConductorAgent, qs: readonly LaterQuestion[], now: number) {
   const itemId = isTaskRef(row.planItem) ? row.planItem : null
@@ -1196,7 +1285,7 @@ async function addLaterQuestions($: $, row: ConductorAgent, qs: readonly LaterQu
     const known = new Set(list.map(q => q.question))
     const added = qs
       .filter(q => q.question && !known.has(q.question))
-      .map((q, i) => ({ id: `l-${row.id}-${i}`, itemId, from: row.description, question: q.question, assumed: q.assumed, why: q.why, choices: q.choices, chosen: q.chosen, askedAt: now }))
+      .map((q, i) => ({ id: `l-${row.id}-${i}`, itemId, from: row.description, question: q.question, assumed: q.assumed, why: q.why, choices: q.choices, chosen: q.chosen, agent: agentLabel(row), askedAt: now }))
     return uniqueIds([...list, ...added]).slice(-30)
   })
   notify($, `${plural(qs.length, 'question')} for later from ${itemId ?? row.description}: no rush, work goes on.`, false)
@@ -1219,6 +1308,7 @@ function uniqueIds<T extends { id: string }>(list: readonly T[]): T[] {
 
 /** The person's answer to a question left for later; `keep` confirms what the agent assumed. Nothing waited on it. */
 async function answerLater($: $, qid: string, answer: string, how: 'answer' | 'keep' | 'dismiss') {
+  drafts.delete(`la-${qid}`)
   const q = (await read($, laterQuestionsA)).find(x => x.id === qid)
   if (!q) return
   // Only the first with that id: lists kept from before ids were made unique may hold two.
@@ -1248,6 +1338,7 @@ async function answerLater($: $, qid: string, answer: string, how: 'answer' | 'k
 
 /** Empties the For later list without recording anything, like dismissing each question. */
 async function dismissAllLater($: $) {
+  for (const k of [...drafts.keys()]) if (k.startsWith('la-')) drafts.delete(k)
   await update($, laterQuestionsA, () => [])
   await refreshStatus($)
 }
@@ -1333,6 +1424,10 @@ async function stopRun($: $): Promise<string> {
   const run = await read($, runA)
   if (!run) return 'No plan run is active.'
   await update($, runA, () => null)
+  await update($, heldA, () => ({}))
+  holdTimer?.cancel()
+  holdTimer = null
+  holdTimerAt = 0
   const runners = (await read($, agentsA)).filter(a => a.status === 'running' && a.role === 'run')
   for (const a of runners) await stopAgent($, a.id)
   await refreshStatus($)
@@ -1362,7 +1457,6 @@ async function pump($: $) {
   try {
     const run = await read($, runA)
     if (!run?.isActive || run.isPaused) return
-    if ((await read($, todayA)).isWrappingUp) return
     const plan = await refreshPlan($, true)
     if (!plan) {
       await finishRun($, 'the plan is gone')
@@ -1372,15 +1466,35 @@ async function pump($: $) {
     const runners = agents.filter(a => a.status === 'running' && (a.role === 'run' || a.role === 'verify'))
     const busy = await busyItems($)
     const ready = readyItems(plan.items ?? [], busy).filter(i => !run.only || run.only.includes(i.id!))
-    const room = Math.max(0, cfg.maxParallel - runners.filter(a => a.role === 'run').length - launching.size)
-    for (const item of ready.slice(0, room)) {
-      const attempt = ((await read($, attemptsA))[item.id!]?.count ?? 0) + 1
-      await dispatchItem($, item as ConductorPlanItem & { id: string }, { attempt }).catch(err =>
-        $.ui.log(`conductor: dispatch of ${item.id} failed: ${String(err)}`),
-      )
+    // Holds that no longer apply: the task is not ready any more, or its check has nothing left to check.
+    const readyIds = new Set(ready.map(i => i.id))
+    const planItems = plan.items ?? []
+    for (const key of Object.keys(await read($, heldA))) {
+      const id = key.startsWith('verify:') ? key.slice(7) : key
+      const it = planItems.find(i => i.id === id)
+      const isStale = key.startsWith('verify:') ? !it || it.state === 'done' : !readyIds.has(id)
+      if (isStale) await update($, heldA, m => without(m, key))
     }
+    // Held checks try again first.
+    const verifying = Object.values(await read($, verifyingA))
+    for (const key of Object.keys(await read($, heldA)).filter(k => k.startsWith('verify:'))) {
+      const it = planItems.find(i => i.id === key.slice(7))
+      if (!it || it.state === 'done' || verifying.includes(it.id!) || launching.has(key)) continue
+      await dispatchVerify($, it as ConductorPlanItem & { id: string }).catch(err => $.ui.log(`conductor: check of ${it.id} failed: ${String(err)}`))
+    }
+    // A held task does not block a smaller one behind it: only started tasks use up the room.
+    let room = Math.max(0, cfg.maxParallel - runners.filter(a => a.role === 'run').length - launching.size)
+    for (const item of ready) {
+      if (room <= 0) break
+      const attempt = ((await read($, attemptsA))[item.id!]?.count ?? 0) + 1
+      const r = await dispatchItem($, item as ConductorPlanItem & { id: string }, { attempt }).catch(err => {
+        $.ui.log(`conductor: dispatch of ${item.id} failed: ${String(err)}`)
+      })
+      if (r === 'started') room--
+    }
+    await scheduleHoldWake($)
     const questions = (await read($, questionsA)).filter(q => q.itemId)
-    if (ready.length === 0 && runners.length === 0 && launching.size === 0 && Object.keys(await read($, verifyingA)).length === 0) {
+    if (ready.length === 0 && runners.length === 0 && launching.size === 0 && Object.keys(await read($, verifyingA)).length === 0 && Object.keys(await read($, heldA)).length === 0) {
       await finishRun($, questions.length ? `${plural(questions.length, 'question')} wait for the user` : '')
     }
   } finally {
@@ -1391,31 +1505,44 @@ async function pump($: $) {
 type DispatchOpts = { attempt: number; tier?: ConductorTier }
 
 /** Launches a plan task's agent; the task counts as launching (busy) until its launch has an outcome. */
-async function dispatchItem($: $, item: ConductorPlanItem & { id: string }, opts: DispatchOpts) {
-  if (launching.has(item.id)) return
+async function dispatchItem($: $, item: ConductorPlanItem & { id: string }, opts: DispatchOpts): Promise<'started' | 'held' | 'skipped'> {
+  if (launching.has(item.id)) return 'skipped'
   launching.add(item.id)
   const release = () => void launching.delete(item.id)
   try {
-    await dispatchItemNow($, item, opts, release)
+    return await dispatchItemNow($, item, opts, release)
   } catch (err) {
     release()
     throw err
   }
 }
 
-async function dispatchItemNow($: $, item: ConductorPlanItem & { id: string }, opts: DispatchOpts, release: () => void) {
+async function dispatchItemNow($: $, item: ConductorPlanItem & { id: string }, opts: DispatchOpts, release: () => void): Promise<'started' | 'held' | 'skipped'> {
   const plan = await refreshPlan($, true)
   // The plan may have moved on since this launch was queued: a task ticked done, or one for the person, stays put.
   const current = itemById(plan, item.id)
-  if (!plan || !current || current.state === 'done' || isGated(current)) return release()
+  if (!plan || !current || current.state === 'done' || isGated(current)) {
+    release()
+    return 'skipped'
+  }
   const p = await paths($)
   const agent = item.agent && WORK_AGENTS.has(item.agent) ? item.agent : 'builder'
   const type = `conductor:${agent}`
   const brief = await ensureBrief($, plan, item)
+  // A held task keeps the model it was given, so waiting does not ask the classifier again.
+  const prior = (await read($, heldA))[item.id]
   const choice: Choice = opts.tier
     ? { model: opts.tier, reason: 'escalated', kind: kindOf(item.text, type) }
-    : await chooseModel($, `${item.text}\n${item.files.join(' ')}`, type, undefined, item.id)
+    : prior && prior.attempt === opts.attempt
+      ? { model: prior.tier, reason: prior.choiceReason, kind: prior.kind }
+      : await chooseModel($, `${item.text}\n${item.files.join(' ')}`, type, undefined, item.id)
   const tier = choice.model ?? (item.model ? clampTier(item.model, cfg.topModel) : 'sonnet')
+  const est = estimateCost(costHistory, choice.kind, agent, tier)
+  if (await holdIfNoRoom($, item.id, item.id, est, { tier, choiceReason: choice.reason, kind: choice.kind, attempt: opts.attempt })) {
+    release()
+    return 'held'
+  }
+  reservedUsd.set(item.id, est.usd)
   const description = `${item.id}: ${clipText(item.text, 48)}${opts.attempt > 1 ? ` (try ${opts.attempt})` : ''}`
   const effort = item.effort ?? effortFor(type, tier)
   dispatchMeta.set(description, { role: 'run', type, reason: choice.reason, kind: choice.kind, attempt: opts.attempt, effort, planItem: item.id })
@@ -1424,11 +1551,13 @@ async function dispatchItemNow($: $, item: ConductorPlanItem & { id: string }, o
   await launchThen($, { subagentType: type, description, prompt, model: tier }, async l => {
     try {
       const agentId = l.agentId
+      reservedUsd.delete(item.id)
       if (agentId === undefined) {
         dispatchMeta.delete(description)
         await noteLaunchFailure($, item.id, tier, l)
         return
       }
+      reservedUsd.set(agentId, est.usd)
       await update($, launchIssuesA, m => without(m, item.id))
       await upsertAgent(
         $,
@@ -1442,6 +1571,8 @@ async function dispatchItemNow($: $, item: ConductorPlanItem & { id: string }, o
       release()
     }
   })
+
+  return 'started'
 }
 
 /** A plan task whose agent could not be launched: the reason goes to its brief and the pane. Not an attempt at the task. */
@@ -1489,11 +1620,17 @@ async function dispatchVerify($: $, item: ConductorPlanItem & { id: string }) {
 async function dispatchVerifyNow($: $, item: ConductorPlanItem & { id: string }, release: () => void) {
   const p = await paths($)
   const description = `verify ${item.id}`
+  const key = `verify:${item.id}`
+  const est = estimateCost(costHistory, 'verifier', 'verifier', 'haiku')
+  if (await holdIfNoRoom($, key, `the check of ${item.id}`, est, { tier: 'haiku', choiceReason: 'verification', kind: 'verifier', attempt: 1 })) return release()
+  reservedUsd.set(key, est.usd)
   dispatchMeta.set(description, { role: 'verify', type: 'conductor:verifier', reason: 'verification', kind: 'verifier', attempt: 1, effort: 'low', planItem: null })
   const prompt = P.verifyTaskPrompt(item, relTo(p.root, briefPath(p.dir, item.id)))
   await launchThen($, { subagentType: 'conductor:verifier', description, prompt, model: 'haiku' }, async l => {
     try {
       const agentId = l.agentId
+      reservedUsd.delete(key)
+      if (agentId !== undefined) reservedUsd.set(agentId, est.usd)
       if (agentId === undefined) {
         dispatchMeta.delete(description)
         const now = await $.clock.now()
@@ -1533,6 +1670,7 @@ async function finishRun($: $, note: string) {
 
 /** What an agent's final report means: its row, the plan, the briefs, the queue, the learning. Runs once per agent. */
 async function completeAgent($: $, agentId: string, answer: string, reason: string, usage: (TokenUsage & { model?: string }) | null) {
+  reservedUsd.delete(agentId)
   const row = (await read($, agentsA)).find(a => a.id === agentId)
   if (!row || row.status !== 'running') return
   const report = extractStatus(answer)
@@ -1555,7 +1693,15 @@ async function completeAgent($: $, agentId: string, answer: string, reason: stri
     done: isOk && a.total ? a.total : a.done,
     tasks: settleTasks(a.tasks ?? [], isOk ? 'done' : status === 'stopped' ? 'stopped' : 'blocked'),
   }))
-  if (usage && tier) await addSpend($, tier, usage)
+  if (usage && tier) {
+    await addSpend($, tier, usage)
+    const cost = costOf(tier, usage)
+    if (Number.isFinite(cost) && cost > 0) {
+      const agentType = row.type.replace(/^conductor:/, '')
+      costHistory = recordCost(costHistory, row.kind || agentType, agentType, tier, cost)
+      await $.store.set('costs', costHistory)
+    }
+  }
 
   const source = `${row.planItem && isTaskRef(row.planItem) ? `${row.planItem}, ` : ''}${row.model} agent`
   await appendDecisions($, extractDecisions(answer), source)
@@ -1569,7 +1715,7 @@ async function completeAgent($: $, agentId: string, answer: string, reason: stri
   else if (row.role === 'upkeep') await finishUpkeep($, status === 'done')
   else if (isTaskRef(row.planItem)) await onTaskReport($, row, { status, isOk, reason, needs, summary })
   else if (needs) {
-    await addQuestion($, { id: `q-${agentId}`, itemId: null, agentId, from: row.description, question: needs.question, options: needs.options, why: needs.why, choices: needs.choices, askedAt: now })
+    await addQuestion($, { id: `q-${agentId}`, itemId: null, agentId, from: row.description, question: needs.question, options: needs.options, why: needs.why, choices: needs.choices, agent: agentLabel(row), askedAt: now })
   }
 
   if (row.role !== 'upkeep') whenFramed(() => maybeUpkeep($))
@@ -1605,7 +1751,7 @@ async function onTaskReport($: $, row: ConductorAgent, o: TaskOutcome) {
   }
   if (o.needs) {
     await markPlan($, id, 'blocked')
-    await addQuestion($, { id: `q-${row.id}`, itemId: id, agentId: row.id, from: row.description, question: o.needs.question, options: o.needs.options, why: o.needs.why, choices: o.needs.choices, askedAt: now })
+    await addQuestion($, { id: `q-${row.id}`, itemId: id, agentId: row.id, from: row.description, question: o.needs.question, options: o.needs.options, why: o.needs.why, choices: o.needs.choices, agent: agentLabel(row), askedAt: now })
     return
   }
   const item = itemById(await read($, planA), id)
@@ -1944,12 +2090,13 @@ async function tidyState($: $) {
           .map(q => {
             const options: string[] = Array.isArray(q.options) ? q.options.filter((o: unknown): o is string => typeof o === 'string') : []
             const choices: ConductorChoice[] = Array.isArray(q.choices) ? q.choices : options.map(label => ({ label, detail: '', isRecommended: false }))
-            return { ...q, options, why: str(q.why), choices }
+            return { ...q, options, why: str(q.why), choices, agent: str(q.agent) }
           })
       : [],
   )
-  await update($, laterQuestionsA, list => uniqueIds(Array.isArray(list) ? list.filter(q => q && typeof q.id === 'string').map(q => ({ ...q, assumed: str(q.assumed), from: str(q.from), why: str(q.why), choices: Array.isArray(q.choices) ? q.choices : [], chosen: typeof q.chosen === 'number' ? q.chosen : null })).filter(q => q.choices.length > 0 || q.assumed !== '' || String(q.question ?? '').includes('?')) : []))
+  await update($, laterQuestionsA, list => uniqueIds(Array.isArray(list) ? list.filter(q => q && typeof q.id === 'string').map(q => ({ ...q, assumed: str(q.assumed), from: str(q.from), why: str(q.why), agent: str(q.agent), choices: Array.isArray(q.choices) ? q.choices : [], chosen: typeof q.chosen === 'number' ? q.chosen : null })).filter(q => q.choices.length > 0 || q.assumed !== '' || String(q.question ?? '').includes('?')) : []))
   await update($, launchIssuesA, m => (m && typeof m === 'object' ? m : {}))
+  await update($, heldA, m => (m && typeof m === 'object' && !Array.isArray(m) ? m : {}))
   await update($, runA, r => (r ? { ...r, done: Array.isArray(r.done) ? r.done : [], blocked: Array.isArray(r.blocked) ? r.blocked : [], only: Array.isArray(r.only) ? r.only : null } : r))
   await update($, expandedA, m => (m && typeof m === 'object' ? m : {}))
 }
@@ -1957,6 +2104,9 @@ async function tidyState($: $) {
 /** What the pane's drawing did lately, per surface, for `/conductor diag`: no model calls, nothing written until asked. */
 type DrawRecord = { started: number; finished: number; lastStartAt: number; lastEndAt: number; lastMs: number; lastError: string; chars: number; nodes: number; props: unknown; tree: unknown }
 const paneDraws: Record<string, DrawRecord> = {}
+/** Half-typed "Other" answers by Input key. Not $.state: a write per keystroke would redraw the pane and reset the field. */
+const drafts = new Map<string, string>()
+let lastTickRedrawAt = 0
 
 /** Draws through `draw`; when drawing throws, a short note says why instead of the engine dropping the pane. */
 async function safeDraw(
@@ -2084,7 +2234,12 @@ async function tick($: $) {
       const reason = info.status === 'completed' ? 'answer' : info.status === 'killed' || info.status === 'stopped' ? 'aborted' : 'error'
       await completeAgent($, a.id, answer, reason, null)
     }
-    $.ui.invalidate('ui.render')
+    // Only elapsed times change with the clock; a redraw with nothing running resets nothing useful, so it is rare.
+    const anyRunning = (await read($, agentsA)).some(x => x.status === 'running')
+    if (anyRunning || now - lastTickRedrawAt >= 30000) {
+      lastTickRedrawAt = now
+      $.ui.invalidate('ui.render')
+    }
   } catch (err) {
     $.ui.log(`conductor: tick failed: ${String(err)}`)
   } finally {
@@ -2192,6 +2347,28 @@ export const register: Register = (on, options) => {
     if (cfg.showPane && (await read($, questionsA)).length) void openPane($, false, 'questions')
     const learned = await $.store.get('routing')
     if (learned && typeof learned === 'object') await update($, routingA, () => learned as Record<string, never>)
+    const storedCosts = await $.store.get('costs')
+    if (storedCosts && typeof storedCosts === 'object' && !Array.isArray(storedCosts)) {
+      const clean: ConductorCostHistory = {}
+      for (const [k, v] of Object.entries(storedCosts as Record<string, unknown>)) {
+        if (Array.isArray(v) && v.every(x => typeof x === 'number' && Number.isFinite(x))) clean[k] = v as number[]
+      }
+      costHistory = clean
+    }
+    const storedRatio = await $.store.get('usageRatio')
+    if (storedRatio && typeof storedRatio === 'object' && !Array.isArray(storedRatio)) {
+      const clean: ConductorUsageRatio = {}
+      for (const [k, v] of Object.entries(storedRatio as Record<string, unknown>)) {
+        const row = v as { usd?: unknown; pts?: unknown } | null
+        if (row && typeof row.usd === 'number' && typeof row.pts === 'number' && Number.isFinite(row.usd) && Number.isFinite(row.pts)) clean[k] = { usd: row.usd, pts: row.pts }
+      }
+      usageRatio = clean
+    }
+    try {
+      lastWindows = [...(await $.session.usage()).rateLimits]
+    } catch {
+      lastWindows = []
+    }
     const today = dayOf(await $.clock.now())
     for (const key of await $.store.keys()) {
       if (key.startsWith('budget:') && !key.startsWith(`budget:${today}:`)) await $.store.delete(key)
@@ -2550,6 +2727,17 @@ export const register: Register = (on, options) => {
       costUsd: e.cost?.usd ?? null,
     }))
     if (e.cost && e.changed.includes('cost')) await measureBudget($, e.cost.usd)
+    lastWindows = [...e.rateLimits]
+    if (e.cost) {
+      const cur: UsageSample = { usd: e.cost.usd, pct: Object.fromEntries(e.rateLimits.map(l => [l.kind, l.percentUsed])) }
+      const learned = learnRatio(usageRatio, lastUsageSample, cur)
+      lastUsageSample = cur
+      if (learned !== usageRatio) {
+        usageRatio = learned
+        await $.store.set('usageRatio', learned)
+      }
+    }
+    await pumpIfRoom($)
     if (cfg.rateLimitDownshift > 0 && e.changed.includes('rateLimits')) {
       const worst = Math.max(0, ...e.rateLimits.map(l => l.percentUsed))
       const isDown = worst >= cfg.rateLimitDownshift
@@ -2658,7 +2846,8 @@ export const register: Register = (on, options) => {
         await update($, budgetA, () => v)
         await update($, todayA, t => ({ ...t, isWrappingUp: false }))
         await checkBudget($)
-        return { text: v ? `Daily budget set to ${usd(v)}: near it the conductor wraps up (no new tasks); models are never changed for it.` : 'Daily budget off.' }
+        if (Object.keys(await read($, heldA)).length) requestPump($)
+        return { text: v ? `Daily budget set to ${usd(v)}: a plan task starts only when enough of it is left for that task; models are never changed for it.` : 'Daily budget off.' }
       }
       case 'expand':
       case 'tasks': {
@@ -2747,7 +2936,7 @@ export const register: Register = (on, options) => {
 
   // Presses, typing and picks in the mod's pane and band: frames, so what they start runs inside one.
   on('ui.press', async ($, e, next) => (e.plugin === $.plugin.name ? framedHandler($, () => next(e)) : next(e)))
-  on('ui.input', async ($, e, next) => (e.plugin === $.plugin.name ? framedHandler($, () => next(e)) : next(e)))
+  on('ui.input', async ($, e, next) => (e.plugin === $.plugin.name && e.kind === 'submit' ? framedHandler($, () => next(e)) : next(e)))
   on('ui.select', async ($, e, next) => (e.plugin === $.plugin.name ? framedHandler($, () => next(e)) : next(e)))
 
   on('ui.render', { component: 'Pane', requestId: QPANE }, async ($, e) => safeDraw($, () => $.ui.resolve(e), { surface: e.surface, props: e.props, pane: 'questions' }, async () => {
@@ -2759,99 +2948,148 @@ export const register: Register = (on, options) => {
     const isLaterOpen = open.later ?? true
     const Input = hasInput(t) ? t.Input : null
 
-    const tag = (q: { itemId: string | null; from: string; question: string }) => (
-      <Text wrap="wrap">
-        <Text color="claude">{q.itemId ?? clipText(q.from, 30)}</Text> {q.question}
-      </Text>
-    )
-    const why = (q: { why?: string }) =>
-      (q.why ?? '') !== '' && (
-        <Text dimColor wrap="wrap">
-          Why it matters: {q.why}
-        </Text>
-      )
-    // One column per suggested answer: the button (and its marks), the explanation under it.
-    const choiceRows = (
-      prefix: string,
-      qid: string,
-      q: { choices?: ConductorChoice[]; options?: string[] },
-      chosen: number | null,
-      onPick: (label: string, i: number) => void,
+    const cols = Math.max(24, Number(e.props.bodyColumns) || 60)
+    const isNarrow = cols < 36
+
+    // One card per question: header (task, agent), the question, why, suggested answers, own answer, actions.
+    const card = (
+      kind: 'urgent' | 'later',
+      q: ConductorQuestion | ConductorLaterQuestion,
+      index: number,
     ) => {
-      const choices: ConductorChoice[] = (q.choices ?? []).length > 0 ? (q.choices ?? []) : (q.options ?? []).map(label => ({ label, detail: '', isRecommended: false }))
-      return choices.map((c, i) => (
-        <Box key={`${prefix}w-${qid}-${i}`} flexDirection="column">
-          <Box flexDirection="row" gap={1}>
-            <Button key={`${prefix}-${qid}-${i}`} label={c.label} onPress={() => onPick(c.label, i)} />
-            {c.isRecommended && <Text color="success">recommended</Text>}
-            {chosen === i && <Text dimColor>the agent went with this</Text>}
+      const isUrgent = kind === 'urgent'
+      const qid = q.id
+      const lead = q.itemId ?? clipText(q.from, 40)
+      const title = q.itemId ? clipText(q.from.replace(/^[A-Z]+\d+(\.\d+)*:\s*/, '').replace(/\s*\(try \d+\)$/, ''), 60) : ''
+      const agent = str(q.agent)
+      const later = q as ConductorLaterQuestion
+      const chosen = isUrgent ? null : (later.chosen ?? null)
+      const assumed = isUrgent ? '' : str(later.assumed)
+      const prefix = isUrgent ? 'qo' : 'lo'
+      const inputKey = isUrgent ? `qa-${qid}` : `la-${qid}`
+      const onPick = (label: string, i: number) =>
+        isUrgent ? act(answerQuestion($, qid, label, 'user')) : act(i === chosen ? answerLater($, qid, '', 'keep') : answerLater($, qid, label, 'answer'))
+      const onText = (v: string) => {
+        const s = v.trim()
+        if (s) act(isUrgent ? answerQuestion($, qid, s, 'user') : answerLater($, qid, s, 'answer'))
+      }
+      const choices: ConductorChoice[] = (q.choices ?? []).length > 0 ? (q.choices ?? []) : isUrgent ? ((q as ConductorQuestion).options ?? []).map(label => ({ label, detail: '', isRecommended: false })) : []
+      const border = isNarrow ? {} : isUrgent ? { borderStyle: 'round' as const, borderColor: 'warning', paddingX: 1 } : { borderStyle: 'round' as const, borderDimColor: true, paddingX: 1 }
+      return (
+        <Box key={`${isUrgent ? 'q' : 'lq'}-${qid}`} flexDirection="column" marginTop={1} paddingLeft={isNarrow ? 1 : undefined} {...border}>
+          {isNarrow && index > 0 && <Text dimColor>{'─'.repeat(Math.min(cols - 2, 40))}</Text>}
+          <Box flexDirection="row" justifyContent="space-between" gap={1}>
+            <Text wrap="truncate-end">
+              <Text bold color="claude">
+                {lead}
+              </Text>
+              {title !== '' && <Text dimColor>{` · ${title}`}</Text>}
+            </Text>
+            {agent !== '' && (
+              <Text dimColor wrap="truncate-end">
+                {agent}
+              </Text>
+            )}
           </Box>
-          {(c.detail ?? '') !== '' && (
-            <Box paddingLeft={2}>
+          <Box marginTop={1}>
+            <Text bold wrap="wrap">
+              {clipText(q.question, 1500)}
+            </Text>
+          </Box>
+          {str(q.why) !== '' && (
+            <Text dimColor wrap="wrap">
+              Why it matters: {clipText(str(q.why), 1000)}
+            </Text>
+          )}
+          {choices.length > 0 && (
+            <Box flexDirection="column" marginTop={1}>
+              <Text dimColor>Suggested answers</Text>
+              {choices.map((c, i) => (
+                <Box key={`${prefix}w-${qid}-${i}`} flexDirection="column" marginTop={i === 0 ? 0 : 1}>
+                  <Box flexDirection="row" gap={1}>
+                    <Button key={`${prefix}-${qid}-${i}`} label={c.label} variant={c.isRecommended ? 'primary' : undefined} onPress={() => onPick(c.label, i)} />
+                    {c.isRecommended && <Text color="success">★</Text>}
+                    {c.isRecommended && <Text color="success">recommended</Text>}
+                    {chosen === i && <Text color="claude">●</Text>}
+                    {chosen === i && <Text color="claude">the agent went with this</Text>}
+                  </Box>
+                  {str(c.detail) !== '' && (
+                    <Box paddingLeft={2}>
+                      <Text dimColor wrap="wrap">
+                        {clipText(c.detail, 1000)}
+                      </Text>
+                    </Box>
+                  )}
+                </Box>
+              ))}
+            </Box>
+          )}
+          {!isUrgent && choices.length === 0 && assumed !== '' && (
+            <Text dimColor wrap="wrap">
+              went on assuming: {assumed}
+            </Text>
+          )}
+          {Input && e.surface !== 'mobile' ? (
+            <Box flexDirection="column" marginTop={1} width="100%">
+              <Text dimColor>Or write your own answer (Enter sends it)</Text>
+              <Input key={inputKey} placeholder="Type here" submitLabel="send" value={drafts.get(inputKey) ?? ''} onInput={v => void drafts.set(inputKey, v)} onSubmit={onText} />
+            </Box>
+          ) : (
+            <Box marginTop={1}>
               <Text dimColor wrap="wrap">
-                {c.detail}
+                To write your own answer, open this chat in the desktop app or the terminal.
               </Text>
             </Box>
           )}
+          <Box flexDirection="row" gap={2} marginTop={1}>
+            {isUrgent && <Button key={`qd-${qid}`} plain label="let AI decide" onPress={() => act(answerQuestion($, qid, '', 'delegate'))} />}
+            {isUrgent && <Button key={`qx-${qid}`} plain dimColor label="dismiss" onPress={() => act(answerQuestion($, qid, '', 'dismiss'))} />}
+            {!isUrgent && assumed !== '' && <Button key={`lk-${qid}`} plain label="keep what the agent chose" onPress={() => act(answerLater($, qid, '', 'keep'))} />}
+            {!isUrgent && <Button key={`ld-${qid}`} plain dimColor label="dismiss" onPress={() => act(answerLater($, qid, '', 'dismiss'))} />}
+          </Box>
         </Box>
-      ))
+      )
     }
 
     return (
       <Box flexDirection="column">
-        {questions.length === 0 && later.length === 0 && <Text dimColor>No questions right now.</Text>}
+        {questions.length === 0 && later.length === 0 && (
+          <Box flexDirection="column" alignItems="center" paddingY={1}>
+            <Text color="success">✓ All clear</Text>
+            <Text>No questions right now.</Text>
+            <Text dimColor wrap="wrap">
+              When an agent needs your view, its question shows up here.
+            </Text>
+          </Box>
+        )}
 
         {questions.length > 0 && (
           <Box flexDirection="column" marginBottom={1}>
-            <Text bold color="warning">
-              Needs you ({questions.length})
-            </Text>
-            <Text dimColor>these tasks wait for your answer</Text>
-            {questions.map(q => (
-              <Box key={`q-${q.id}`} flexDirection="column" paddingLeft={1} marginBottom={1}>
-                {tag(q)}
-                {why(q)}
-                {choiceRows('qo', q.id, q, null, label => act(answerQuestion($, q.id, label, 'user')))}
-                {Input && <Input key={`qa-${q.id}`} placeholder="Other: write your own answer" submitLabel="send" onSubmit={v => act(answerQuestion($, q.id, v, 'user'))} />}
-                <Box flexDirection="row" gap={1}>
-                  <Button key={`qd-${q.id}`} label="let AI decide" onPress={() => act(answerQuestion($, q.id, '', 'delegate'))} />
-                  <Button key={`qx-${q.id}`} plain dimColor label="dismiss" onPress={() => act(answerQuestion($, q.id, '', 'dismiss'))} />
-                </Box>
-              </Box>
-            ))}
+            <Box flexDirection="row" gap={1}>
+              <Text bold color="warning">
+                ● Needs you ({questions.length})
+              </Text>
+              <Text dimColor>work on these tasks waits for your answer</Text>
+            </Box>
+            {questions.map((q, i) => card('urgent', q, i))}
           </Box>
         )}
 
         {later.length > 0 && (
           <Box flexDirection="column" marginBottom={1}>
-            <Box flexDirection="row" gap={1}>
-              <Button
-                key="tg-later"
-                plain
-                label={`${isLaterOpen ? '▾' : '▸'} For later (${later.length})`}
-                onPress={() => void update($, expandedA, m => ({ ...m, later: !(m.later ?? true) }))}
-              />
-              <Text dimColor>no rush: work goes on</Text>
+            <Box flexDirection="row" justifyContent="space-between">
+              <Box flexDirection="row" gap={1}>
+                <Button
+                  key="tg-later"
+                  plain
+                  label={`${isLaterOpen ? '▾' : '▸'} For later (${later.length})`}
+                  onPress={() => void update($, expandedA, m => ({ ...m, later: !(m.later ?? true) }))}
+                />
+                <Text dimColor>no rush: work goes on</Text>
+              </Box>
               {later.length >= 2 && <Button key="ld-all" plain dimColor label="dismiss all" onPress={() => act(dismissAllLater($))} />}
             </Box>
-            {isLaterOpen &&
-              later.map(q => (
-                <Box key={`lq-${q.id}`} flexDirection="column" paddingLeft={1} marginBottom={1}>
-                  {tag(q)}
-                  {why(q)}
-                  {choiceRows('lo', q.id, q, q.chosen ?? null, (label, i) => act(i === q.chosen ? answerLater($, q.id, '', 'keep') : answerLater($, q.id, label, 'answer')))}
-                  {(q.choices ?? []).length === 0 && (q.assumed ?? '') !== '' && (
-                    <Text dimColor wrap="wrap">
-                      went on assuming: {q.assumed}
-                    </Text>
-                  )}
-                  {Input && <Input key={`la-${q.id}`} placeholder="Other: write your own answer" submitLabel="send" onSubmit={v => act(answerLater($, q.id, v, 'answer'))} />}
-                  <Box flexDirection="row" gap={1}>
-                    {(q.assumed ?? '') !== '' && <Button key={`lk-${q.id}`} label="keep what the agent chose" onPress={() => act(answerLater($, q.id, '', 'keep'))} />}
-                    <Button key={`ld-${q.id}`} plain dimColor label="dismiss" onPress={() => act(answerLater($, q.id, '', 'dismiss'))} />
-                  </Box>
-                </Box>
-              ))}
+            {isLaterOpen && later.map((q, i) => card('later', q, i))}
           </Box>
         )}
       </Box>
@@ -2877,6 +3115,7 @@ export const register: Register = (on, options) => {
     const budget = await budgetOf($)
     const attempts = await read($, attemptsA)
     const verifying = await read($, verifyingA)
+    const held = await read($, heldA)
     const launchIssues = await read($, launchIssuesA)
     const laterQuestions = await read($, laterQuestionsA)
     const isDown = await read($, downshiftA)
@@ -2923,16 +3162,20 @@ export const register: Register = (on, options) => {
       const w = workers.get(item.id)
       if (w) return `← ${w.model}${w.attempt > 1 ? ` · try ${w.attempt}` : ''}`
       if (checking.has(item.id)) return 'verifying'
+      if (held[`verify:${item.id}`]) return `check waits for usage: ${held[`verify:${item.id}`]!.short}`
       if (questions.some(q => q.itemId === item.id)) return 'needs you'
       if (isGated(item) && item.state !== 'done') return 'for you / main agent'
+      const hold = held[item.id]
+      if (hold && item.state !== 'done') return `waiting for usage: ${hold.short}`
       const issue = launchIssues[item.id]
       if (issue && item.state !== 'done') return `couldn't start: ${clipText(issue.reason, 48)}`
       const tries = attempts[item.id]
       return tries && item.state !== 'done' ? `${plural(tries.count, 'failed try')} · last on ${tries.tier}` : ''
     }
 
+    const holds = holdList(held, items)
     const running = agents.filter(a => a.status === 'running').sort((a, b) => a.startedAt - b.startedAt)
-    const finished = agents.filter(a => a.status !== 'running').sort((a, b) => (b.endedAt ?? 0) - (a.endedAt ?? 0)).slice(0, 8)
+    const finished = agents.filter(a => a.status !== 'running').sort((a, b) => (b.endedAt ?? 0) - (a.endedAt ?? 0)).slice(0, KEEP_FINISHED)
     const isAllOpen = agents.length > 0 && agents.every(a => isOpen(`a:${a.id}`, all))
     const spentRows = Object.values(spend)
     const spent = spentRows.reduce((s, x) => s + x.usd, 0)
@@ -3081,12 +3324,25 @@ export const register: Register = (on, options) => {
             </Text>
             <Text dimColor>
               {run.dispatched} dispatched · {run.done.length} done{run.blocked.length ? ` · ${run.blocked.length} blocked` : ''}
+              {holds.length ? ` · ${holds.length} waiting for usage` : ''}
               {today.isWrappingUp ? ' · budget wrap-up' : ''}
             </Text>
             {run.isActive && (
               <Button key="pause" label={run.isPaused ? 'resume' : 'pause'} hotkey="p" onPress={() => act(setPaused($, !run.isPaused).then(m => $.ui.toast(m)))} />
             )}
             <Button key="stop-run" label="stop run" onPress={() => act(stopRun($).then(m => $.ui.toast(m)))} />
+          </Box>
+        )}
+        {holds.slice(0, 3).map(hd => (
+          <Box key={`hold-${hd.key}`} paddingLeft={2}>
+            <Text color="warning" wrap="wrap">
+              {cleanText(clipText(`⧗ ${hd.label} waits for usage: ${hd.hold.reason}`, 400))}
+            </Text>
+          </Box>
+        ))}
+        {holds.length > 3 && (
+          <Box paddingLeft={2}>
+            <Text dimColor>… and {holds.length - 3} more waiting</Text>
           </Box>
         )}
         {!run && plan && isApproved && ready.length > 0 && (
@@ -3106,7 +3362,7 @@ export const register: Register = (on, options) => {
         </Box>
         {mainCounts.total > 0 && (
           <Box flexDirection="row" gap={1} paddingLeft={2} alignItems="center">
-            {drawBar(t, e.surface, 'plan', mainFrac, barCells, mainMarks, `Plan ${pctOf(mainFrac)}%`)}
+            {drawBar(t, e.surface, progressKind(mainFrac), mainFrac, barCells, mainMarks, `Plan ${pctOf(mainFrac)}%`)}
             <Text bold>{pctOf(mainFrac)}%</Text>
           </Box>
         )}
@@ -3269,6 +3525,9 @@ export const register: Register = (on, options) => {
       const laterCount = (await read($, laterQuestionsA)).length
       const paneWaiting = (await read($, paneStateA)).waiting !== null
       const running = agents.filter(a => a.status === 'running')
+      const held = await read($, heldA)
+      const verifyingMap = await read($, verifyingA)
+      const now = await $.clock.now()
       if (isHidden || (await modeOf($)) === 'off' || (!plan && running.length === 0 && questions.length === 0 && laterCount === 0)) return next(e)
 
       const t = $.ui.resolve(e)
@@ -3279,9 +3538,10 @@ export const register: Register = (on, options) => {
       const frac = plan ? fracOf({ total: plan.total, done: plan.done, doing: plan.doing, blocked: plan.blocked }) : 0
       const barCells = Math.max(12, Math.min(44, Math.floor(cols / 3)))
       const working = running.length ? `${plural(running.length, 'agent')} working` : ''
+      const heldCount = Object.keys(held).length
       const runChip = run ? (run.isPending ? '⧗ awaiting approval' : run.isPaused ? '⏸ paused' : '▶ running') : ''
       const details = plan
-        ? [`${plan.done}/${plan.total} tasks`, plan.doing ? `${plan.doing} in progress` : '', plan.blocked ? `${plan.blocked} blocked` : '', plan.phase, working]
+        ? [`${plan.done}/${plan.total} tasks`, plan.doing ? `${plan.doing} in progress` : '', plan.blocked ? `${plan.blocked} blocked` : '', heldCount ? `${heldCount} waiting for usage` : '', plan.phase, working]
         : ['no plan yet', working]
       const toggle = () => void update($, expandedA, m => ({ ...m, band: !(m.band ?? false) }))
 
@@ -3297,23 +3557,65 @@ export const register: Register = (on, options) => {
       const header = (
         <Box flexDirection="row" gap={1} alignItems="center">
           {plan ? (
-            <Button key="band-toggle" plain label={`${isBandOpen ? '▾' : '▸'} ${plan.title ? clipText(plan.title, 28) : 'Project'}`} onPress={toggle} />
+            <Button key="band-toggle" plain label={`${isBandOpen ? '▾' : '▸'} ${plan.title ? clipText(plan.title, Math.max(16, Math.floor(cols / 2))) : 'Project'}`} onPress={toggle} />
           ) : (
             <Text bold>Project</Text>
           )}
-          {plan && drawBar(t, e.surface, 'plan', frac, barCells, planMarks(items, barCells), `Project ${pctOf(frac)}% done`)}
-          {plan && <Text bold>{pctOf(frac)}%</Text>}
           {runChip !== '' && <Text color={run?.isActive && !run.isPaused ? 'success' : 'warning'}>{runChip}</Text>}
           {questions.length + laterCount > 0 && (
             <Button key="questions-chip" plain label={[questions.length ? `${questions.length} need you` : '', laterCount ? `${laterCount} for later` : ''].filter(Boolean).join(' · ')} onPress={() => act(openPane($, true, 'questions'))} />
           )}
           {issueCount > 0 && <Text color="error">{issueCount} couldn't start</Text>}
-          <Text dimColor wrap="truncate-end">
-            {details.filter(Boolean).join(' · ')}
-          </Text>
+          {!plan && (
+            <Text dimColor wrap="truncate-end">
+              {details.filter(Boolean).join(' · ')}
+            </Text>
+          )}
           <Button key="agents" label={paneWaiting ? 'show agents' : 'agents'} plain onPress={() => act(openPane($, true))} />
         </Box>
       )
+
+      const itemOf = (id: string | undefined) => (id ? items.find(i => i.id === id) : undefined)
+      const labels = [...running].sort((a, b) => a.startedAt - b.startedAt).map(a => {
+        if (a.type.replace(/^conductor:/, '') === 'verifier' || /^verify /.test(a.description)) {
+          const id = verifyingMap[a.id] ?? a.description.replace(/^verifys+/, '').trim()
+          const it = itemOf(id)
+          return it ? `checking ${planItemText(it)}` : a.description
+        }
+        const it = a.planItem ? itemOf(a.planItem.toUpperCase()) : undefined
+        return it ? planItemText(it) : a.description
+      })
+      let nowLine = null
+      if (labels.length) {
+        const more = labels.length > 1 ? `+${labels.length - 1} more` : ''
+        nowLine = (
+          <Box flexDirection="row" gap={1}>
+            <Text color={STATUS_TONE.running}>◉</Text>
+            <Text wrap="truncate-end">{clipText(labels[0]!, Math.max(12, cols - 4 - (more ? more.length + 2 : 0)))}</Text>
+            {more !== '' && <Text dimColor>{more}</Text>}
+          </Box>
+        )
+      } else if (Object.keys(held).length) {
+        const list = holdList(held, items)
+        const first = list[0]!
+        nowLine = (
+          <Box flexDirection="row" gap={1}>
+            <Text color="warning" wrap="truncate-end">
+              {clipText(`⧗ ${first.label} waits for usage: ${first.hold.short}${first.hold.retryAt ? `, starts ${whenText(first.hold.retryAt, now)}` : ''}`, Math.max(12, cols - 4))}
+            </Text>
+            {list.length > 1 && <Text dimColor>+{list.length - 1} more</Text>}
+          </Box>
+        )
+      }
+      const barLine = plan ? (
+        <Box flexDirection="row" gap={1} alignItems="center">
+          {drawBar(t, e.surface, progressKind(frac), frac, barCells, planMarks(items, barCells), `Project ${pctOf(frac)}% done`)}
+          <Text bold>{pctOf(frac)}%</Text>
+          <Text dimColor wrap="truncate-end">
+            {details.filter(Boolean).join(' · ')}
+          </Text>
+        </Box>
+      ) : null
 
       let body: ReturnType<typeof taskRow>[] = []
       let phaseLine = null
@@ -3359,6 +3661,8 @@ export const register: Register = (on, options) => {
         <Box flexDirection="column">
           {cleanTree(welcomeRow)}
           {cleanTree(header)}
+          {cleanTree(nowLine)}
+          {cleanTree(barLine)}
           {cleanTree(phaseLine)}
           {cleanTree(body)}
           {below}

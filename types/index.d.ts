@@ -156,6 +156,8 @@ export type ConductorQuestion = {
   why: string
   /** Suggested answers (up to 5), same labels as `options`. For old questions, built from `options` with no detail. */
   choices: ConductorChoice[]
+  /** Who asked, e.g. `builder · sonnet`; empty for old questions. */
+  agent: string
   askedAt: number
 }
 
@@ -163,7 +165,7 @@ export type ConductorQuestion = {
 export type ConductorToday = { day: string; usd: number; isWrappingUp: boolean }
 
 /** A question an agent left for the person without stopping: it went on with `assumed`. */
-export type ConductorLaterQuestion = { id: string; itemId: string | null; from: string; question: string; assumed: string; why: string; choices: ConductorChoice[]; chosen: number | null; askedAt: number }
+export type ConductorLaterQuestion = { id: string; itemId: string | null; from: string; question: string; assumed: string; why: string; choices: ConductorChoice[]; chosen: number | null; /** Who asked, e.g. `builder · sonnet`; empty for old questions. */ agent: string; askedAt: number }
 
 /** A plan task whose agent could not be launched: why, when, after how many tries. Not an attempt at the task. */
 export type ConductorLaunchIssue = { reason: string; at: number; tries: number; model: string }
@@ -172,6 +174,25 @@ export type ConductorOutcome = { ok: number; fail: number }
 
 /** Outcomes per routing kind and tier: what the router learns from. */
 export type ConductorRouting = Record<string, Partial<Record<ConductorTier, ConductorOutcome>>>
+
+/** Recent agent costs in US dollars, by `<kind>|<tier>` and `<agent>|<tier>`, newest last (at most 8 each). */
+export type ConductorCostHistory = Record<string, number[]>
+
+/** Per rate-limit window kind: the spend seen and the window points it moved, to learn points per dollar. */
+export type ConductorUsageRatio = Record<string, { usd: number; pts: number }>
+
+/** A plan task (or its check) held because not enough usage is left: the reason in plain words, a short form for one-line displays, when room should return (ms; null if unknown), and the model choice to reuse when it starts. */
+export type ConductorHold = {
+  reason: string
+  short: string
+  retryAt: number | null
+  estimateUsd: number
+  tier: ConductorTier
+  choiceReason: string
+  kind: string
+  attempt: number
+  at: number
+}
 
 declare module 'claude-code' {
   interface PluginState {
@@ -203,6 +224,8 @@ declare module 'claude-code' {
       routing: ConductorRouting
       /** By plan task id: launches that failed, shown in the pane until retried or dismissed. */
       launchIssues: Record<string, ConductorLaunchIssue>
+      /** Plan work waiting for usage, by task id (`T15`) or `verify:<id>` for its check. */
+      held: Record<string, ConductorHold>
       /** Questions agents left for later: answering them blocks nothing. */
       laterQuestions: ConductorLaterQuestion[]
       /** The agents pane: whether the person closed it (unasked opens then skip it), and why the engine left it waiting. */

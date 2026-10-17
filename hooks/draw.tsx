@@ -21,8 +21,8 @@ export const STATUS_TONE: Record<ConductorAgentStatus, string> = {
 }
 const TEXT_FILL: Record<BarKind, string | null> = {
   plan: 'success',
-  agent: 'suggestion',
-  estimate: null,
+  agent: 'ide',
+  estimate: 'ide',
   ok: 'success',
   warn: 'warning',
   full: 'error',
@@ -97,6 +97,9 @@ export const ink = (color: string | null) => (color ? { color } : { dimColor: tr
 
 export const pctOf = (frac: number) => Math.round(Math.min(1, Math.max(0, frac)) * 100)
 
+/** Blue while work is in progress, green once it is all done. */
+export const progressKind = (frac: number): BarKind => (frac >= 1 ? 'plan' : 'agent')
+
 /** A progress bar with checkpoint dots: SVG where the surface draws it, text in the terminal. */
 export function drawBar(t: Table, surface: RenderSurface, kind: BarKind, frac: number, cells: number, marks: readonly Mark[], alt: string) {
   if (surface !== 'terminal' && 'Svg' in t) {
@@ -106,7 +109,7 @@ export function drawBar(t: Table, surface: RenderSurface, kind: BarKind, frac: n
     return <Svg source={svgBar(frac, width, marks, SVG_FILL[kind])} alt={alt} width={width} height={SVG_HEIGHT} />
   }
   const { Text } = t
-  const fill = TEXT_FILL[kind]
+  const fill = surface === 'terminal' ? TEXT_FILL[kind] : SVG_FILL[kind]
   const inkOf = (tone: Tone) =>
     tone === 'fill' || tone === 'done' ? ink(fill) : tone === 'track' || tone === 'todo' ? ink(null) : ink(DOT_TONE[tone])
 

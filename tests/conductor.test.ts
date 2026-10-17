@@ -3,7 +3,7 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine, Mounted } from 'claude-code/testing'
 
 import { marksOf, svgBar, textBar } from '../hooks/bar'
-import { cleanTree, uniqueKeys } from '../hooks/draw'
+import { cleanTree, progressKind, uniqueKeys } from '../hooks/draw'
 import { getSection, parseVerdict, recordResult, renderBrief, setSection } from '../hooks/briefs'
 import { extractDecisions, extractKnowledge, extractNeeds, extractQuestions, extractStatus, stripKnowledge } from '../hooks/notes'
 import {
@@ -21,6 +21,7 @@ import {
 import { costOf, learnedTier, nextTier, recordOutcome, routeTask } from '../hooks/route'
 import { AUTONOMY_LEVELS, LATER_EXAMPLE, PLAIN, URGENT_EXAMPLE, architectPrompt, policyLine, protocol, runTaskPrompt, verifierPrompt } from '../hooks/prompts'
 import { spillNote, textOfResult } from '../hooks/spill'
+import { DEFAULT_TASK_USD, checkRoom, estimateCost, learnRatio, nextMidnight, pointsPerUsd, recordCost, whenText, windowName } from '../hooks/usage'
 import { fromProgress, fromTodos, settleTasks, taskCreated, taskUpdated } from '../hooks/tasks'
 
 const OPTIONS = { options: { showPane: false, classifier: false, sound: false } }
@@ -292,6 +293,11 @@ describe('bars', () => {
   test('too many checkpoints for the width: the bar alone', () => {
     const marks = marksOf(Array.from({ length: 10 }, () => ({ weight: 1, state: 'todo' as const })))
     expect(textBar(0, 10, marks).map(s => s.text).join('')).toBe('──────────')
+  })
+
+  test('the plan bar is blue while work is in progress and green once done', () => {
+    expect(progressKind(0.4)).toBe('agent')
+    expect(progressKind(1)).toBe('plan')
   })
 
   test('the SVG bar draws a dot per checkpoint', () => {
@@ -682,12 +688,16 @@ describe('hooks', () => {
       }
       memFs(on, files)
       const spawned: string[] = []
+      const models: Array<string | undefined> = []
       on('agent.spawn', (_, e) => {
         spawned.push(e.description)
+        models.push(e.model)
         return { model: 'claude-haiku-4-5', agentId: `ag-${spawned.length}` }
       })
-      on('agent.list', () => ({ value: spawned.map((d, i) => ({ id: `ag-${i + 1}`, description: d, type: 'conductor:builder', status: 'running' })) }))
-      return { files, spawned }
+      const ended = new Set<string>()
+      on('agent.list', () => ({ value: spawned.map((d, i) => ({ id: `ag-${i + 1}`, description: d, type: 'conductor:builder', status: ended.has(`ag-${i + 1}`) ? 'completed' : 'running' })) }))
+      on('session.measure', (_, e) => ({ changed: e.changed }))
+      return { files, spawned, models, ended }
     }
 
     test('an approved plan stays approved when it is edited: the run does not wait again', OPTIONS, async ($, on) => {
@@ -743,11 +753,15 @@ describe('hooks', () => {
 
     const QPROPS = { ...PANE, title: 'Questions' }
     const keysOf = (node: unknown, out: string[] = []): string[] => {
-      const n = node as { key?: string; children?: unknown[] }
-      if (n.key) out.push(n.key)
-      for (const c of n.children ?? []) keysOf(c, out)
+      const n = node as { key?: string; props?: { key?: string }; children?: unknown[] }
+      const key = n.props?.key ?? n.key
+      if (key) out.push(key)
+      for (const c of n.children ?? []) if (c && typeof c === 'object') keysOf(c, out)
       return out
     }
+    test('keysOf finds keys in drawn trees (props.key) and plain nodes', () => {
+      expect(keysOf({ props: { key: 'a' }, children: [{ key: 'b' }, { props: { key: 'c' }, children: [] }] })).toEqual(['a', 'b', 'c'])
+    })
     const questionsPane = ($: Engine, surface: 'terminal' | 'desktop' | 'mobile') =>
       $.ui.mount({ plugin: 'conductor', surface, component: 'Pane', requestId: 'conductor-questions', props: QPROPS })
 
@@ -787,7 +801,170 @@ describe('hooks', () => {
         if (surface === 'mobile') expect(input).toBeUndefined()
         else expect(input).toBeDefined()
         const keys = keysOf(await ui.drawn())
+        expect(keys.length).toBeGreaterThan(0)
         expect(new Set(keys).size).toBe(keys.length)
+        await ui.unmount()
+      }
+    })
+
+    const TWO = '# Plan: Demo\n## Phase 1\n- [ ] T1: Write the parser {model: haiku}\n- [ ] T2: Write the printer {model: haiku}'
+    const askBoth = async ($: Engine, on: On) => {
+      const clock = mock.clock(on, { now: Date.UTC(2026, 9, 15, 12) })
+      mock.store(on)
+      const { files } = project(on, TWO)
+      await $.command.run({ command: 'conductor', args: 'run' } as never)
+      await clock.advance(100)
+      await $.turn.complete({ turnId: 't1', agentId: 'ag-1', answer: `STATUS: blocked\n${URGENT_EXAMPLE}`, reason: 'answer', durationMs: 1, isAborted: false })
+      await $.turn.complete({ turnId: 't2', agentId: 'ag-2', answer: `STATUS: done\nPrinter written.\n<questions>\n${LATER_EXAMPLE}\n</questions>\n<knowledge>none</knowledge>`, reason: 'answer', durationMs: 1, isAborted: false })
+      await clock.advance(100)
+      return { clock, files }
+    }
+    const textNode = (node: unknown, text: string): { props: Record<string, unknown> } | undefined => {
+      const n = node as { type?: string; props?: Record<string, unknown>; children?: unknown[] }
+      if (n.type === 'Text' && (n.children ?? []).every(c => typeof c === 'string') && (n.children ?? []).join('') === text) return n as never
+      for (const c of n.children ?? []) { if (c && typeof c === 'object') { const r = textNode(c, text); if (r) return r } }
+      return undefined
+    }
+    type Found = { props: Record<string, unknown> } | undefined
+
+    test('the Questions pane lays out one card per question with header, bold question, suggested answers and a full-width own-answer box, on every surface', OPTIONS, async ($, on) => {
+      await askBoth($, on)
+      for (const surface of ['terminal', 'desktop', 'mobile'] as const) {
+        const ui = await questionsPane($, surface)
+        const card = (await ui.find({ key: 'q-q-ag-1' })) as Found
+        expect(card?.props.borderStyle).toBe('round')
+        expect(card?.props.borderColor).toBe('warning')
+        const later = (await ui.find({ key: 'lq-l-ag-2-0' })) as Found
+        expect(later?.props.borderStyle).toBe('round')
+        expect(later?.props.borderDimColor).toBe(true)
+        const lead = textNode(await ui.drawn(), 'T1')
+        expect(lead?.props.bold).toBe(true)
+        expect(lead?.props.color).toBe('claude')
+        expect(await ui.find({ type: 'Text', text: /· haiku/ })).toBeDefined()
+        const question = textNode(await ui.drawn(), 'Should the report show prices with tax included?')
+        expect(question?.props.bold).toBe(true)
+        expect((await ui.find({ type: 'Button', key: 'qo-q-ag-1-0' }) as Found)?.props.variant).toBe('primary')
+        expect((await ui.find({ type: 'Button', key: 'qo-q-ag-1-1' }) as Found)?.props.variant).toBeUndefined()
+        expect(await ui.find({ type: 'Text', text: '★' })).toBeDefined()
+        expect(await ui.find({ type: 'Text', text: 'Suggested answers' })).toBeDefined()
+        expect(await ui.find({ type: 'Text', text: /Needs you \(1\)/ })).toBeDefined()
+        if (surface === 'mobile') {
+          expect(await ui.find({ type: 'Input' })).toBeUndefined()
+          expect(await ui.find({ type: 'Text', text: /open this chat in the desktop app/ })).toBeDefined()
+        } else {
+          const input = (await ui.find({ type: 'Input', key: 'qa-q-ag-1' })) as Found
+          expect(input).toBeDefined()
+          expect(input?.props.label).toBeUndefined()
+          expect(await ui.find({ type: 'Text', text: /Or write your own answer/ })).toBeDefined()
+        }
+        const keys = keysOf(await ui.drawn())
+        expect(keys.length).toBeGreaterThan(0)
+        expect(new Set(keys).size).toBe(keys.length)
+        await ui.unmount()
+      }
+    })
+
+    test('on a narrow pane the cards have no border and are told apart by a rule', OPTIONS, async ($, on) => {
+      await askBoth($, on)
+      const ui = await $.ui.mount({ plugin: 'conductor', surface: 'desktop', component: 'Pane', requestId: 'conductor-questions', props: { ...QPROPS, bodyColumns: 30 } })
+      const later = (await ui.find({ key: 'lq-l-ag-2-1' })) as Found
+      expect(later).toBeDefined()
+      expect(later?.props.borderStyle).toBeUndefined()
+      expect(((await ui.find({ key: 'q-q-ag-1' })) as Found)?.props.borderStyle).toBeUndefined()
+      expect(await ui.find({ type: 'Text', text: /^─+$/ })).toBeDefined()
+      const keys = keysOf(await ui.drawn())
+      expect(keys.length).toBeGreaterThan(0)
+      expect(new Set(keys).size).toBe(keys.length)
+      await ui.unmount()
+    })
+
+    test('with no questions the pane says all clear, on every surface', OPTIONS, async ($, on) => {
+      mock.clock(on, { now: Date.UTC(2026, 9, 15, 12) })
+      mock.store(on)
+      project(on, TWO)
+      for (const surface of ['terminal', 'desktop', 'mobile'] as const) {
+        const ui = await questionsPane($, surface)
+        expect(await ui.find({ type: 'Text', text: '✓ All clear' })).toBeDefined()
+        expect(await ui.find({ type: 'Text', text: 'No questions right now.' })).toBeDefined()
+        await ui.unmount()
+      }
+    })
+
+    describe('every answer path records on the desktop surface', () => {
+      const paths: { name: string; act: (ui: Awaited<ReturnType<typeof questionsPane>>) => Promise<void>; check: (files: Record<string, string>, ui: Awaited<ReturnType<typeof questionsPane>>) => Promise<void> }[] = [
+        { name: 'urgent option', act: async ui => void (await ui.press({ key: 'qo-q-ag-1-1' })), check: async f => expect(f['/proj/.knowledge/decisions.md']).toContain('→ Leave tax out') },
+        { name: 'urgent own answer', act: ui => (ui as never as { input: (e: object) => Promise<void> }).input({ key: 'qa-q-ag-1', text: 'tax only on export' }), check: async f => expect(f['/proj/.knowledge/decisions.md']).toContain('→ tax only on export') },
+        {
+          name: 'urgent let AI decide',
+          act: async ui => void (await ui.press({ key: 'qd-q-ag-1' })),
+          check: async (f, ui) => {
+            expect(await ui.find({ type: 'Button', key: 'qd-q-ag-1' })).toBeUndefined()
+            expect(f['/proj/.knowledge/tasks/T1.md']).toContain('The user leaves this to you')
+          },
+        },
+        {
+          name: 'urgent dismiss',
+          act: async ui => void (await ui.press({ key: 'qx-q-ag-1' })),
+          check: async (f, ui) => {
+            expect(await ui.find({ type: 'Button', key: 'qx-q-ag-1' })).toBeUndefined()
+            expect(f['/proj/.knowledge/decisions.md'] ?? '').not.toContain('Leave tax out')
+            expect(f['/proj/.knowledge/tasks/T1.md']).not.toContain('Answers from the user')
+          },
+        },
+        { name: 'later option', act: async ui => void (await ui.press({ key: 'lo-l-ag-2-0-1' })), check: async f => expect(f['/proj/.knowledge/decisions.md']).toContain('Should old reports be kept after the upgrade? → Delete them') },
+        { name: 'later keep', act: async ui => void (await ui.press({ key: 'lk-l-ag-2-0' })), check: async f => expect(f['/proj/.knowledge/decisions.md']).toContain("the user kept the agent's assumption") },
+        { name: 'later own answer', act: ui => (ui as never as { input: (e: object) => Promise<void> }).input({ key: 'la-l-ag-2-0', text: 'keep for a year' }), check: async f => expect(f['/proj/.knowledge/decisions.md']).toContain('→ keep for a year') },
+        {
+          name: 'later dismiss',
+          act: async ui => void (await ui.press({ key: 'ld-l-ag-2-0' })),
+          check: async (f, ui) => {
+            expect(await ui.find({ type: 'Button', key: 'ld-l-ag-2-0' })).toBeUndefined()
+            expect(await ui.find({ type: 'Button', text: /For later \(1\)/ })).toBeDefined()
+            expect(f['/proj/.knowledge/decisions.md'] ?? '').not.toContain('Delete them')
+          },
+        },
+        {
+          name: 'dismiss all',
+          act: async ui => void (await ui.press({ key: 'ld-all' })),
+          check: async (_, ui) => {
+            expect(await ui.find({ type: 'Button', text: /For later/ })).toBeUndefined()
+            expect(await ui.find({ type: 'Text', text: /Needs you \(1\)/ })).toBeDefined()
+          },
+        },
+      ]
+      for (const p of paths) {
+        test(p.name, OPTIONS, async ($, on) => {
+          const { clock, files } = await askBoth($, on)
+          const ui = await questionsPane($, 'desktop')
+          await p.act(ui)
+          await clock.advance(100)
+          await p.check(files, ui)
+          await ui.unmount()
+        })
+      }
+    })
+
+    test('a stored question from before the agent label draws without one and without error', OPTIONS, async ($, on) => {
+      mock.clock(on, { now: Date.UTC(2026, 9, 15, 12) })
+      mock.store(on)
+      on('session.start', () => ({ cwd: '/proj' }) as never)
+      on('command.register', () => ({ value: true }) as never)
+      on('agent.register', () => ({ value: true }) as never)
+      on('tool.register', () => ({ value: true }) as never)
+      let seeded = false
+      on('state.get', async (_, e, next) => {
+        const r = await next(e)
+        if (e.key !== 'questions' || seeded) return r
+        seeded = true
+        return { value: { ...(r.value ?? {}), value: [{ id: 'q-old', itemId: null, agentId: 'old', from: 'old agent', question: 'Old question?', options: ['yes', 'no'], askedAt: 1 }] } } as never
+      })
+      project(on, TWO)
+      await ($.session as unknown as { start: (e: object) => Promise<unknown> }).start({ cwd: '/proj' })
+      for (const surface of ['terminal', 'desktop', 'mobile'] as const) {
+        const ui = await questionsPane($, surface)
+        expect(await ui.find({ type: 'Text', text: 'Old question?' })).toBeDefined()
+        expect(await ui.find({ type: 'Text', text: /·/ })).toBeUndefined()
+        expect(await ui.find({ type: 'Button', key: 'qo-q-old-0' })).toBeDefined()
         await ui.unmount()
       }
     })
@@ -826,6 +1003,74 @@ describe('hooks', () => {
       await ui.unmount()
     })
 
+    test('text typed in an Other box survives redraws; submit records it; empty submit keeps the question; drafts are per question', OPTIONS, async ($, on) => {
+      const clock = mock.clock(on, { now: Date.UTC(2026, 9, 15, 12) })
+      mock.store(on)
+      const { files } = project(on, '# Plan: Demo\n## Phase 1\n- [ ] T1: Write the parser {model: haiku}\n- [ ] T2: Write the printer {model: haiku}')
+      await $.command.run({ command: 'conductor', args: 'run' } as never)
+      await clock.advance(100)
+      await $.turn.complete({ turnId: 't1', agentId: 'ag-1', answer: `STATUS: blocked\n${URGENT_EXAMPLE}`, reason: 'answer', durationMs: 1, isAborted: false })
+      await $.turn.complete({ turnId: 't2', agentId: 'ag-2', answer: `STATUS: done\nPrinter written.\n<questions>\n${LATER_EXAMPLE}\n</questions>\n<knowledge>none</knowledge>`, reason: 'answer', durationMs: 1, isAborted: false })
+      await clock.advance(100)
+      const redraw = async (ui: Awaited<ReturnType<typeof questionsPane>>) => {
+        await ui.press({ key: 'tg-later' })
+        await clock.advance(100)
+        await ui.press({ key: 'tg-later' })
+        await clock.advance(100)
+      }
+      let n = 0
+      for (const surface of ['terminal', 'desktop'] as const) {
+        n++
+        const ui = (await questionsPane($, surface)) as unknown as Awaited<ReturnType<typeof questionsPane>> & { input: (e: object) => Promise<void> }
+        const dec = () => files['/proj/.knowledge/decisions.md'] ?? ''
+        // An empty or spaces-only submit keeps the question.
+        await ui.input({ key: 'qa-q-ag-1', text: '   ' })
+        await clock.advance(100)
+        expect(await ui.find({ type: 'Text', text: /Needs you \(1\)/ })).toBeDefined()
+        expect(dec()).not.toContain('→   ')
+
+        const urgent = `urgent ${surface} ${'x'.repeat(120)}`
+        await ui.input({ key: 'qa-q-ag-1', text: urgent, kind: 'change' } as never)
+        await redraw(ui)
+        expect((await ui.find({ type: 'Input', key: 'qa-q-ag-1' }))?.props.value).toBe(urgent)
+        expect(dec()).not.toContain(urgent)
+
+        const later = `later ${surface} ${'y'.repeat(120)}`
+        await ui.input({ key: 'la-l-ag-2-0', text: later, kind: 'change' } as never)
+        await ui.input({ key: 'la-l-ag-2-1', text: 'second draft', kind: 'change' } as never)
+        await redraw(ui)
+        expect((await ui.find({ type: 'Input', key: 'la-l-ag-2-0' }))?.props.value).toBe(later)
+        expect((await ui.find({ type: 'Input', key: 'la-l-ag-2-1' }))?.props.value).toBe('second draft')
+        expect(dec()).not.toContain(later)
+        const keys = keysOf(await ui.drawn())
+        expect(keys.length).toBeGreaterThan(0)
+        expect(new Set(keys).size).toBe(keys.length)
+
+        // Answering one later question leaves the other's draft alone.
+        await ui.press({ key: 'lo-l-ag-2-0-1' })
+        await clock.advance(100)
+        expect(await ui.find({ type: 'Input', key: 'la-l-ag-2-0' })).toBeUndefined()
+        expect((await ui.find({ type: 'Input', key: 'la-l-ag-2-1' }))?.props.value).toBe('second draft')
+        await ui.input({ key: 'la-l-ag-2-1', text: 'second draft' })
+        await clock.advance(100)
+        expect(dec()).toContain('→ second draft')
+
+        await ui.input({ key: 'qa-q-ag-1', text: urgent })
+        await clock.advance(100)
+        expect(dec()).toContain(`→ ${urgent}`)
+        expect(await ui.find({ type: 'Input', key: 'qa-q-ag-1' })).toBeUndefined()
+        await ui.unmount()
+
+        if (surface === 'terminal') {
+          // Fresh questions for the desktop round.
+          files['/proj/.knowledge/plan.md'] = '# Plan: Demo\n## Phase 1\n- [ ] T1: Write the parser {model: haiku}\n- [ ] T2: Write the printer {model: haiku}'
+          await $.turn.complete({ turnId: `t${n}a`, agentId: 'ag-1', answer: `STATUS: blocked\n${URGENT_EXAMPLE}`, reason: 'answer', durationMs: 1, isAborted: false })
+          await $.turn.complete({ turnId: `t${n}b`, agentId: 'ag-2', answer: `STATUS: done\nPrinter written.\n<questions>\n${LATER_EXAMPLE}\n</questions>\n<knowledge>none</knowledge>`, reason: 'answer', durationMs: 1, isAborted: false })
+          await clock.advance(100)
+        }
+      }
+    })
+
     test('dismiss all empties the For later list without recording anything, on terminal and desktop', OPTIONS, async ($, on) => {
       const clock = mock.clock(on, { now: Date.UTC(2026, 9, 15, 12) })
       mock.store(on)
@@ -839,6 +1084,7 @@ describe('hooks', () => {
         const ui = await questionsPane($, surface)
         expect(await ui.find({ type: 'Button', key: 'ld-all', text: 'dismiss all' })).toBeDefined()
         const keys = keysOf(await ui.drawn())
+        expect(keys.length).toBeGreaterThan(0)
         expect(new Set(keys).size).toBe(keys.length)
         await ui.press({ key: 'ld-all' })
         await clock.advance(100)
@@ -925,6 +1171,329 @@ describe('hooks', () => {
       })
     })
 
+    describe('usage check before starting', () => {
+      const NOW = new Date(2026, 9, 15, 12).getTime()
+      const dayKey = () => {
+        const d = new Date(NOW)
+        return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+      }
+      /** Fakes what was spent today, whatever the mod writes. */
+      const spentToday = (on: On, usd: number, isWrappingUp = false) =>
+        on('state.get', async (_, e, next) => {
+          const r = await next(e)
+          if (e.key !== 'today') return r
+          return { value: { ...(r.value ?? {}), value: { day: dayKey(), usd, isWrappingUp } } } as never
+        })
+      const toasts = (on: On) => {
+        const out: string[] = []
+        on('ui.toast', async (_, e, next) => {
+          out.push(e.text)
+          return next(e)
+        })
+        return out
+      }
+      const TWO_MODELS = '# Plan: Demo\n## Phase 1\n- [ ] T1: Write the big parser {model: sonnet}\n- [ ] T2: Write the small printer {model: haiku}'
+      const measure = ($: Engine, windows: Array<{ kind: string; percentUsed: number; resetsAt?: string }>) =>
+        $.session.measure({ context: { window: 200000 }, rateLimits: windows, cost: { usd: 0 }, changed: ['rateLimits'] } as never)
+
+      test('a task that does not fit the budget is held while a smaller one starts; raising the budget starts it on the same model', OPTIONS, async ($, on) => {
+        const clock = mock.clock(on, { now: NOW })
+        mock.store(on)
+        const said = toasts(on)
+        spentToday(on, 1.5)
+        const { files, spawned, models } = project(on, TWO_MODELS)
+
+        await $.command.run({ command: 'conductor', args: 'budget 2' } as never)
+        await $.command.run({ command: 'conductor', args: 'run' } as never)
+        await clock.advance(100)
+        expect(spawned).toEqual(['T2: Write the small printer'])
+        expect(files['/proj/.knowledge/plan.md']).toContain('- [ ] T1')
+        const brief = files['/proj/.knowledge/tasks/T1.md']!
+        expect(brief).toContain('## Waiting for usage')
+        expect(brief).toContain('$1.50')
+        expect(brief).toContain('$0.50')
+        expect(said.some(t => /T1 waits for usage/.test(t))).toBe(true)
+
+        await $.command.run({ command: 'conductor', args: 'budget 20' } as never)
+        await clock.advance(100)
+        expect(spawned).toEqual(['T2: Write the small printer', 'T1: Write the big parser'])
+        expect(models).toContain('sonnet')
+        expect(files['/proj/.knowledge/plan.md']).toContain('- [~] T1')
+      })
+
+      test('a full rate-limit window holds a task until it eases, on the same model', OPTIONS, async ($, on) => {
+        const clock = mock.clock(on, { now: NOW })
+        mock.store(on)
+        const { spawned } = project(on, '# Plan: Demo\n## Phase 1\n- [ ] T1: Write the big parser {model: sonnet}')
+        const full = [{ kind: 'five_hour', percentUsed: 97, resetsAt: new Date(NOW + 3600_000).toISOString() }]
+        await measure($, full)
+        await $.command.run({ command: 'conductor', args: 'run' } as never)
+        await clock.advance(100)
+        expect(spawned).toEqual([])
+
+        await clock.advance(1000)
+        await measure($, [{ kind: 'five_hour', percentUsed: 5, resetsAt: new Date(NOW + 5 * 3600_000).toISOString() }])
+        await clock.advance(1000)
+        expect(spawned).toEqual(['T1: Write the big parser'])
+      })
+
+      test('passing the wrap-up line tells no running agent to stop, and the run is not paused at 100%', OPTIONS, async ($, on) => {
+        const clock = mock.clock(on, { now: NOW })
+        mock.store(on)
+        const { spawned } = project(on, '# Plan: Demo\n## Phase 1\n- [ ] T1: Write the small printer {model: haiku}')
+        const sent: string[] = []
+        on('session.send', async (_, e, next) => {
+          sent.push(JSON.stringify(e))
+          return next(e)
+        })
+        await $.command.run({ command: 'conductor', args: 'run' } as never)
+        await clock.advance(100)
+        expect(spawned.length).toBe(1)
+        await $.command.run({ command: 'conductor', args: 'budget 10' } as never)
+        await $.session.measure({ context: { window: 200000 }, rateLimits: [], cost: { usd: 11 }, changed: ['cost'] } as never)
+        await clock.advance(100)
+        expect(sent.join('\n')).not.toContain('Finish the step you are on')
+        const ui = await $.ui.mount({ plugin: 'conductor', surface: 'terminal', component: 'Pane', requestId: 'conductor-agents', props: PANE })
+        expect(await ui.find({ type: 'Text', text: /paused/i })).toBeUndefined()
+        await ui.unmount()
+      })
+
+      test('a finished agent with usage records its cost under its kind', OPTIONS, async ($, on) => {
+        const clock = mock.clock(on, { now: NOW })
+        const saved: Record<string, unknown> = {}
+        on('store.get', (_, e) => ({ value: saved[e.key] }))
+        on('store.set', (_, e) => {
+          saved[e.key] = e.value
+          return { value: undefined }
+        })
+        on('store.delete', (_, e) => {
+          delete saved[e.key]
+          return { value: undefined }
+        })
+        on('store.keys', () => ({ value: Object.keys(saved) }))
+        const { spawned } = project(on, '# Plan: Demo\n## Phase 1\n- [ ] T1: Write the small printer {model: haiku}')
+        await $.command.run({ command: 'conductor', args: 'run' } as never)
+        await clock.advance(100)
+        expect(spawned.length).toBe(1)
+        await $.turn.complete({
+          turnId: 't1',
+          agentId: 'ag-1',
+          answer: 'STATUS: done\nDone.\n<knowledge>none</knowledge>',
+          reason: 'answer',
+          durationMs: 1,
+          isAborted: false,
+          usage: { input_tokens: 100000, output_tokens: 20000, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, model: 'claude-haiku-4-5' },
+        } as never)
+        await clock.advance(100)
+        const costs = saved['costs'] as Record<string, number[]> | undefined
+        expect(costs).toBeDefined()
+        const keys = Object.keys(costs ?? {})
+        expect(keys.some(k => k.endsWith('|haiku'))).toBe(true)
+        expect(Object.values(costs ?? {}).every(v => v.length === 1 && v[0]! > 0)).toBe(true)
+      })
+
+      describe('what runs and what waits', () => {
+        const BAND = { hasSurvey: false, isWorking: true, maxRows: 10, bodyColumns: 100, scroll: { offset: 0, bodyRows: 9 }, view: {} }
+        const bandOf = ($: Engine, surface: 'terminal' | 'desktop', bodyColumns = 100) =>
+          $.ui.mount({ plugin: 'conductor', surface, component: 'AbovePrompt', props: { ...BAND, bodyColumns } })
+        const agentsPane = ($: Engine, surface: 'terminal' | 'desktop') =>
+          $.ui.mount({ plugin: 'conductor', surface, component: 'Pane', requestId: 'conductor-agents', props: PANE })
+        type N = { type?: string; props?: Record<string, unknown>; children?: unknown[] }
+        /** The closest Box holding the bar (an Svg or the block-drawn Text): does it also hold the band-toggle button? */
+        const barBoxHoldsToggle = (node: unknown, surface: string): boolean | undefined => {
+          const n = node as N
+          const kids = (n.children ?? []).filter((c): c is N => Boolean(c) && typeof c === 'object')
+          const isBar = (c: N) => (surface === 'desktop' ? c.type === 'Svg' : c.type === 'Text' && JSON.stringify(c).includes('━'))
+          if (n.type === 'Box' && kids.some(isBar)) return JSON.stringify(n).includes('band-toggle')
+          for (const c of kids) {
+            const r = barBoxHoldsToggle(c, surface)
+            if (r !== undefined) return r
+          }
+          return undefined
+        }
+        const THREE = '# Plan: Demo\n## Phase 1\n- [ ] T1: Write the parser {model: haiku}\n- [ ] T2: Write the printer {model: haiku}\n- [ ] T3: Write the linter {model: haiku}'
+
+        test('the band names the running task and keeps the bar on its own line, on every surface', OPTIONS, async ($, on) => {
+          const clock = mock.clock(on, { now: NOW })
+          mock.store(on)
+          on('ui.render', (engine, e) => engine.ui.resolve(e).Box({}))
+          const { spawned } = project(on, '# Plan: Demo\n## Phase 1\n- [ ] T1: Write the parser {model: haiku}')
+          await $.command.run({ command: 'conductor', args: 'run' } as never)
+          await clock.advance(100)
+          expect(spawned.length).toBe(1)
+          for (const surface of ['terminal', 'desktop'] as const) {
+            const band = await bandOf($, surface)
+            expect(await band.find({ type: 'Text', text: 'T1 Write the parser' })).toBeDefined()
+            expect(await band.find({ type: 'Text', text: /1 agent working/ })).toBeDefined()
+            expect(barBoxHoldsToggle(await band.drawn(), surface)).toBe(false)
+            const keys = keysOf(await band.drawn())
+            expect(keys.length).toBeGreaterThan(0)
+            expect(new Set(keys).size).toBe(keys.length)
+            await band.unmount()
+          }
+        })
+
+        test('with several running the band shows the first task and "+N more"', OPTIONS, async ($, on) => {
+          const clock = mock.clock(on, { now: NOW })
+          mock.store(on)
+          on('ui.render', (engine, e) => engine.ui.resolve(e).Box({}))
+          const { spawned } = project(on, THREE)
+          await $.command.run({ command: 'conductor', args: 'run' } as never)
+          await clock.advance(100)
+          expect(spawned.length).toBe(3)
+          for (const surface of ['terminal', 'desktop'] as const) {
+            const band = await bandOf($, surface)
+            expect(await band.find({ type: 'Text', text: /^T\d Write the/ })).toBeDefined()
+            expect(await band.find({ type: 'Text', text: '+2 more' })).toBeDefined()
+            const keys = keysOf(await band.drawn())
+            expect(keys.length).toBeGreaterThan(0)
+            expect(new Set(keys).size).toBe(keys.length)
+            await band.unmount()
+          }
+        })
+
+        test('a long task name is clipped to the width and ends with an ellipsis', OPTIONS, async ($, on) => {
+          const clock = mock.clock(on, { now: NOW })
+          mock.store(on)
+          on('ui.render', (engine, e) => engine.ui.resolve(e).Box({}))
+          project(on, '# Plan: Demo\n## Phase 1\n- [ ] T1: Write a very long parser name that cannot possibly fit on one line {model: haiku}')
+          await $.command.run({ command: 'conductor', args: 'run' } as never)
+          await clock.advance(100)
+          for (const surface of ['terminal', 'desktop'] as const) {
+            const band = await bandOf($, surface, 40)
+            expect(await band.find({ type: 'Text', text: /^T1 Write a very/ })).toBeDefined()
+            const label = JSON.stringify(await band.drawn()).match(/"(T1 Write a very[^"]*)"/)?.[1] ?? ''
+            expect(label.length).toBeLessThanOrEqual(36)
+            expect(label.endsWith('…')).toBe(true)
+            await band.unmount()
+          }
+        })
+
+        test('a held task shows as waiting for usage in the band, the Agents pane and the status line', OPTIONS, async ($, on) => {
+          const clock = mock.clock(on, { now: NOW })
+          mock.store(on)
+          spentToday(on, 1.5)
+          const statuses: string[] = []
+          on('ui.status', (_, e) => {
+            statuses.push(String(e.text))
+            return { value: undefined }
+          })
+          on('ui.render', (engine, e) => engine.ui.resolve(e).Box({}))
+          const { spawned } = project(on, '# Plan: Demo\n## Phase 1\n- [ ] T1: Write the big parser {model: sonnet}')
+          await $.command.run({ command: 'conductor', args: 'budget 2' } as never)
+          await $.command.run({ command: 'conductor', args: 'run' } as never)
+          await clock.advance(100)
+          expect(spawned).toEqual([])
+          expect(statuses.some(x => x.includes('1 waiting for usage'))).toBe(true)
+          for (const surface of ['terminal', 'desktop'] as const) {
+            const band = await bandOf($, surface)
+            expect(await band.find({ type: 'Text', text: /waits for usage/ })).toBeDefined()
+            const bk = keysOf(await band.drawn())
+            expect(new Set(bk).size).toBe(bk.length)
+            await band.unmount()
+            const pane = await agentsPane($, surface)
+            expect(await pane.find({ type: 'Text', text: /waiting for usage:/ })).toBeDefined()
+            expect(await pane.find({ type: 'Text', text: /⧗ T1 waits for usage: / })).toBeDefined()
+            const pk = keysOf(await pane.drawn())
+            expect(new Set(pk).size).toBe(pk.length)
+            await pane.unmount()
+          }
+        })
+
+        /** Colours of the text-bar fill Texts in a drawn tree (leaf Texts holding bar blocks). */
+        const barColors = (node: unknown, out: unknown[] = []): unknown[] => {
+          const n = node as N
+          const kids = (n.children ?? []).filter((c): c is N => Boolean(c) && typeof c === 'object')
+          if (n.type === 'Text' && kids.length === 0 && JSON.stringify(n).includes('━')) out.push(n.props?.color)
+          for (const c of kids) barColors(c, out)
+          return out
+        }
+
+        test('the project bar is blue while the plan is unfinished, on terminal and desktop', OPTIONS, async ($, on) => {
+          const clock = mock.clock(on, { now: NOW })
+          mock.store(on)
+          on('ui.render', (engine, e) => engine.ui.resolve(e).Box({}))
+          project(on, '# Plan: Demo\n## Phase 1\n- [x] T1: Write the parser {model: haiku}\n- [ ] T2: Write the printer {model: haiku}\n- [ ] T3: Write the linter {model: haiku}')
+          await $.command.run({ command: 'conductor', args: 'run' } as never)
+          await clock.advance(100)
+          const term = await bandOf($, 'terminal')
+          expect(barColors(await term.drawn())).toContain('ide')
+          await term.unmount()
+          const desk = await bandOf($, 'desktop')
+          expect(JSON.stringify(await desk.drawn())).toContain('#4C8DF6')
+          await desk.unmount()
+        })
+
+        test('the project bar turns green when every task is done', OPTIONS, async ($, on) => {
+          const clock = mock.clock(on, { now: NOW })
+          mock.store(on)
+          on('ui.render', (engine, e) => engine.ui.resolve(e).Box({}))
+          project(on, '# Plan: Demo\n## Phase 1\n- [x] T1: Write the parser {model: haiku}\n- [x] T2: Write the printer {model: haiku}')
+          await $.command.run({ command: 'conductor', args: 'run' } as never)
+          await clock.advance(100)
+          const term = await bandOf($, 'terminal')
+          expect(barColors(await term.drawn())).toContain('success')
+          await term.unmount()
+          const desk = await bandOf($, 'desktop')
+          expect(JSON.stringify(await desk.drawn())).toContain('#3FB950')
+          await desk.unmount()
+        })
+
+        test('a running agent with no steps reported has a light blue estimate bar', OPTIONS, async ($, on) => {
+          const clock = mock.clock(on, { now: NOW })
+          mock.store(on)
+          on('ui.render', (engine, e) => engine.ui.resolve(e).Box({}))
+          project(on, '# Plan: Demo\n## Phase 1\n- [ ] T1: Write the parser {model: haiku}')
+          await $.command.run({ command: 'conductor', args: 'run' } as never)
+          await clock.advance(100)
+          const term = await agentsPane($, 'terminal')
+          expect(barColors(await term.drawn())).toContain('ide')
+          await term.unmount()
+          const desk = await agentsPane($, 'desktop')
+          expect(JSON.stringify(await desk.drawn())).toContain('#8FB4F8')
+          await desk.unmount()
+        })
+
+        test('the Agents pane keeps the last 5 finished agents', OPTIONS, async ($, on) => {
+          const clock = mock.clock(on, { now: NOW })
+          mock.store(on)
+          const items = Array.from({ length: 7 }, (_, i) => `- [ ] T${i + 1}: Task number ${i + 1} {model: haiku}`).join('\n')
+          const { spawned, ended: done } = project(on, `# Plan: Demo\n## Phase 1\n${items}`)
+          on('ui.render', (engine, e) => engine.ui.resolve(e).Box({}))
+          await $.command.run({ command: 'conductor', args: 'run' } as never)
+          await clock.advance(100)
+          for (let i = 1; i <= 7; i++) {
+            done.add(`ag-${i}`)
+            await $.turn.complete({ turnId: `t${i}`, agentId: `ag-${i}`, answer: 'STATUS: done\nDone.\n<knowledge>none</knowledge>', reason: 'answer', durationMs: 1, isAborted: false })
+            await clock.advance(100)
+          }
+          expect(spawned.length).toBe(7)
+          for (const surface of ['terminal', 'desktop'] as const) {
+            const pane = await agentsPane($, surface)
+            const keys = keysOf(await pane.drawn())
+            expect(keys.filter(k => k.startsWith('tg-ag-')).length).toBe(5)
+            expect(keys.length).toBeGreaterThan(0)
+            expect(new Set(keys).size).toBe(keys.length)
+            await pane.unmount()
+          }
+        })
+      })
+
+      test('a run with only held tasks does not finish', OPTIONS, async ($, on) => {
+        const clock = mock.clock(on, { now: NOW })
+        mock.store(on)
+        const said = toasts(on)
+        spentToday(on, 1.5)
+        const { spawned } = project(on, '# Plan: Demo\n## Phase 1\n- [ ] T1: Write the big parser {model: sonnet}')
+        await $.command.run({ command: 'conductor', args: 'budget 2' } as never)
+        await $.command.run({ command: 'conductor', args: 'run' } as never)
+        await clock.advance(100)
+        expect(spawned).toEqual([])
+        expect(said.some(t => /waits for usage/.test(t))).toBe(true)
+        expect(said.some(t => /plan run finished/i.test(t))).toBe(false)
+      })
+    })
+
     test('the Questions pane still draws questions in the old format', OPTIONS, async ($, on) => {
       const clock = mock.clock(on, { now: Date.UTC(2026, 9, 15, 12) })
       mock.store(on)
@@ -949,6 +1518,7 @@ describe('hooks', () => {
         expect(await ui.find({ type: 'Text', text: /went on assuming: ISO 8601/ })).toBeDefined()
         expect(await ui.find({ type: 'Button', key: 'lk-l-ag-2-0' })).toBeDefined()
         const keys = keysOf(await ui.drawn())
+        expect(keys.length).toBeGreaterThan(0)
         expect(new Set(keys).size).toBe(keys.length)
         await ui.unmount()
       }
@@ -998,6 +1568,7 @@ describe('hooks', () => {
         expect(await ui.find({ type: 'Text', text: 'Questions: 1 need you · 2 for later' })).toBeDefined()
         expect(await ui.find({ type: 'Button', key: 'open-questions' })).toBeDefined()
         const keys = keysOf(await ui.drawn())
+        expect(keys.length).toBeGreaterThan(0)
         expect(new Set(keys).size).toBe(keys.length)
         opened.length = 0
         await ui.press({ key: 'open-questions' })
@@ -1334,5 +1905,113 @@ describe('prompts', () => {
     expect(count(runTaskPrompt(item, 'b.md', 1, policyLine('ask-important')), PLAIN)).toBe(1)
     expect(architectPrompt('/p')).toMatch(/plain language/)
     expect(verifierPrompt('/p')).toMatch(/plain words/)
+  })
+})
+
+describe('usage check', () => {
+  const at = (d: number, h: number, m = 0) => new Date(2026, 9, d, h, m).getTime()
+  const now = at(17, 13)
+  const room = (over: Record<string, unknown> = {}) => ({ budgetUsd: 0, usedUsd: 0, reservedUsd: 0, windows: [], ratio: {}, now, ...over })
+
+  test('recordCost keeps the last 8 per key and writes both keys', () => {
+    let h = {}
+    for (let i = 1; i <= 10; i++) h = recordCost(h, 'build', 'builder:x', 'sonnet', i)
+    expect((h as Record<string, number[]>)['build|sonnet']).toEqual([3, 4, 5, 6, 7, 8, 9, 10])
+    expect((h as Record<string, number[]>)['builder:x|sonnet']).toHaveLength(8)
+    expect(Object.keys(recordCost({}, 'a', 'a', 'haiku', 1))).toEqual(['a|haiku'])
+  })
+
+  test('recordCost ignores bad costs and does not mutate', () => {
+    const h = { 'k|sonnet': [1] }
+    expect(recordCost(h, 'k', 'a', 'sonnet', 0)).toBe(h)
+    expect(recordCost(h, 'k', 'a', 'sonnet', -2)).toBe(h)
+    expect(recordCost(h, 'k', 'a', 'sonnet', NaN)).toBe(h)
+    const next = recordCost(h, 'k', 'a', 'sonnet', 2)
+    expect(h).toEqual({ 'k|sonnet': [1] })
+    expect(next['k|sonnet']).toEqual([1, 2])
+  })
+
+  test('estimateCost uses kind, then agent, then the default', () => {
+    expect(estimateCost({ 'k|sonnet': [1, 2] }, 'k', 'a', 'sonnet')).toEqual({ usd: 1.88, basis: 'kind', samples: 2 })
+    const byAgent = estimateCost({ 'builder:x|sonnet': [1, 1] }, 'k', 'builder:x', 'sonnet')
+    expect(byAgent.basis).toBe('agent')
+    expect(byAgent.usd).toBe(1.25)
+    expect(estimateCost({}, 'k', 'a', 'opus')).toEqual({ usd: DEFAULT_TASK_USD.opus, basis: 'default', samples: 0 })
+    expect(estimateCost({ 'k|sonnet': [9] }, 'k', 'a', 'sonnet').basis).toBe('default')
+  })
+
+  test('learnRatio accumulates, skips resets, halves past $50, ignores null prev', () => {
+    const r1 = learnRatio({}, { usd: 1, pct: { five_hour: 10 } }, { usd: 3, pct: { five_hour: 30 } })
+    expect(r1.five_hour).toEqual({ usd: 2, pts: 20 })
+    const r2 = learnRatio(r1, { usd: 3, pct: { five_hour: 30 } }, { usd: 5, pct: { five_hour: 2 } })
+    expect(r2).toEqual(r1)
+    const r3 = learnRatio({ five_hour: { usd: 49, pts: 100 } }, { usd: 0, pct: { five_hour: 0 } }, { usd: 3, pct: { five_hour: 6 } })
+    expect(r3.five_hour).toEqual({ usd: 26, pts: 53 })
+    const base = { five_hour: { usd: 1, pts: 1 } }
+    expect(learnRatio(base, null, { usd: 5, pct: { five_hour: 9 } })).toBe(base)
+  })
+
+  test('pointsPerUsd needs a dollar of spend', () => {
+    expect(pointsPerUsd({ w: { usd: 0.9, pts: 9 } }, 'w')).toBeNull()
+    expect(pointsPerUsd({}, 'w')).toBeNull()
+    expect(pointsPerUsd({ w: { usd: 2, pts: 20 } }, 'w')).toBe(10)
+  })
+
+  test('whenText speaks plainly', () => {
+    expect(whenText(at(17, 14, 30), now)).toBe('at 14:30')
+    expect(whenText(at(18, 9), now)).toBe('tomorrow at 09:00')
+    expect(whenText(nextMidnight(now), now)).toBe('tomorrow')
+    expect(whenText(at(24, 9), now)).toBe('on Sat 24 Oct at 09:00')
+  })
+
+  test('windowName', () => {
+    expect(windowName('five_hour')).toBe('5-hour usage limit')
+    expect(windowName('seven_day')).toBe('weekly usage limit')
+    expect(windowName('seven_day_opus')).toBe('weekly Opus limit')
+    expect(windowName('seven_day_sonnet')).toBe('weekly Sonnet limit')
+    expect(windowName('spend_limit')).toBe('spending limit')
+    expect(windowName('some_new_one')).toBe('some new one limit')
+  })
+
+  test('checkRoom fits with no budget and no windows', () => {
+    expect(checkRoom(5, room())).toEqual({ fits: true })
+  })
+
+  test('checkRoom holds on the daily budget', () => {
+    const f = checkRoom(3, room({ budgetUsd: 10, usedUsd: 8 }))
+    expect(f).toMatchObject({ fits: false, short: 'daily budget', retryAt: nextMidnight(now) })
+    if (!f.fits) {
+      expect(f.reason).toContain('$3.00')
+      expect(f.reason).toContain('$2.00')
+      expect(f.reason).toContain('$10')
+      expect(f.reason).toContain('tomorrow')
+    }
+    const big = checkRoom(12, room({ budgetUsd: 10 }))
+    expect(big).toMatchObject({ fits: false, short: 'more than the daily budget', retryAt: null })
+    expect(checkRoom(3, room({ budgetUsd: 10, usedUsd: 5, reservedUsd: 3 })).fits).toBe(false)
+    expect(checkRoom(3, room({ budgetUsd: 10, usedUsd: 5, reservedUsd: 2 })).fits).toBe(true)
+  })
+
+  test('checkRoom holds on a nearly full window without a ratio', () => {
+    const resetsAt = new Date(at(17, 16)).toISOString()
+    const f = checkRoom(1, room({ windows: [{ kind: 'five_hour', percentUsed: 96, resetsAt }] }))
+    expect(f).toMatchObject({ fits: false, short: '5-hour usage limit', retryAt: at(17, 16) })
+    if (!f.fits) expect(f.reason).toContain('at 16:00')
+    expect(checkRoom(1, room({ windows: [{ kind: 'five_hour', percentUsed: 90, resetsAt }] })).fits).toBe(true)
+  })
+
+  test('checkRoom uses a learned ratio', () => {
+    const ratio = { five_hour: { usd: 10, pts: 100 } }
+    const windows = [{ kind: 'five_hour', percentUsed: 85 }]
+    const f = checkRoom(2, room({ ratio, windows }))
+    expect(f).toMatchObject({ fits: false, retryAt: null })
+    if (!f.fits) expect(f.reason).toContain('about 20% more')
+    expect(checkRoom(0.4, room({ ratio, windows })).fits).toBe(true)
+  })
+
+  test('checkRoom gives the latest retry time when several checks fail', () => {
+    const resetsAt = new Date(at(17, 16)).toISOString()
+    const f = checkRoom(3, room({ budgetUsd: 10, usedUsd: 9, windows: [{ kind: 'five_hour', percentUsed: 99, resetsAt }] }))
+    expect(f).toMatchObject({ fits: false, short: 'daily budget', retryAt: nextMidnight(now) })
   })
 })

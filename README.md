@@ -36,8 +36,8 @@ A Claude Code mod that turns the main agent into a conductor. The main chat plan
 | **Spilled outputs** | A tool output in the main chat longer than 12,000 characters is saved to `.knowledge/session/spill/`. Only its head, its tail and a pointer stay in the conversation, which is re-sent every turn. |
 | **Context management** | At 45% context the mod saves a handoff note to `session/handoff.md`. At 65% (or 130k tokens) it compacts. After compaction, `/clear` or a new session, it reloads the index, the plan summary and the handoff. |
 | **Knowledge upkeep** | Subagents end reports with `<decisions>` and `<knowledge>` blocks. The mod files them and keeps them out of the main chat. A Haiku curator folds the notes in, updates `map.md` for changed files, and re-checks recorded facts whose source files changed (each fact is tagged `(src: path)`). |
-| **Rate limits** | When a rate-limit window passes 85%, new tasks are capped at Sonnet until it eases. |
-| **Daily budget** | Optional, counted across sessions. At 90% of it the conductor **wraps up**: it starts nothing new, tells running agents to finish their step and report, writes a handoff, and tells the main agent to wind down. At 100% it pauses the run. It never changes models. |
+| **Rate limits** | When a rate-limit window passes 85%, new tasks are capped at Sonnet until it eases. A task also waits ("waiting for usage") when it would not fit in a window: the conductor learns how fast spending fills each window and holds the task until the window resets. |
+| **Daily budget** | Optional, counted across sessions. Before a plan task, a check or knowledge upkeep starts, the conductor estimates its cost from what similar tasks cost before (a first guess per model until it has seen some) and starts it only if that fits in what is left of today's budget. Otherwise the task waits, shown as "waiting for usage" with the reason, and starts by itself the next day or when you raise the budget. Running agents always finish their task. At 90% the main agent is told to wrap up its own work. It never changes models. |
 
 ## What you see
 
@@ -47,15 +47,15 @@ A Claude Code mod that turns the main agent into a conductor. The main chat plan
   - a context bar with dots at the save and compact points;
   - run controls (pause, resume, stop);
   - the plan by phase, expandable, with who is working on each task, verification and failed tries;
-  - running and finished agents, expandable to their step lists, edited files (clickable on desktop) and report summary, with a stop button each.
+  - running agents and the last 5 finished ones, expandable to their step lists, edited files (clickable on desktop) and report summary, with a stop button each.
 
   Runs open the pane only when it is not open already, and never again after you close it yourself; `/conductor pane` always opens it. When the window is too narrow to place it, the status line and the project bar say "pane hidden", with a **show agents** button. If the pane ever fails to draw, it shows the error and a **reset view** button instead of closing.
 
   Underneath are the autonomy picker, spend with the estimated savings versus using Opus for everything, and today against your budget. Buttons: expand all (`e`), edit tasks (`t`), checkpoint (`c`), compact (`k`), upkeep (`u`), report (`o`), clear finished (`x`).
-- **Questions pane** (`/conductor questions`, or the questions chip in the project bar) holds the **Needs you** queue (urgent) and the **For later** list (questions that block nothing; **dismiss all** clears it without recording anything), each with the agent's why-line, its suggested options and a free-text answer. A new urgent question opens it by itself, and so does a chat that starts with urgent questions already waiting (questions for later alone do not), unless it is already open or you closed it.
-- **Project bar** above the prompt shows the plan's progress bar with a dot per task (or per phase), the run state, one questions chip (click it to open the Questions pane; it also shows when only later questions wait), and agents working. Click it, or type `/conductor expand`, to see the current phase's tasks.
+- **Questions pane** (`/conductor questions`, or the questions chip in the project bar) holds the **Needs you** queue (urgent) and the **For later** list (questions that block nothing; **dismiss all** clears it without recording anything), each question is a card that names its task and the agent that asked, with the agent's why-line, its suggested answers (the recommended one is the highlighted button) and a free-text answer box; the box keeps what you type until you press Enter, and an empty Enter does nothing. A new urgent question opens it by itself, and so does a chat that starts with urgent questions already waiting (questions for later alone do not), unless it is already open or you closed it.
+- **Project bar** above the prompt shows the plan's title, the run state, one questions chip (click it to open the Questions pane; it also shows when only later questions wait) and the agents button; under it, the task running right now (shortened to one line, with "+2 more" when several run) or the task waiting for usage; and on its own line the plan's progress bar with a dot per task (or per phase). Click it, or type `/conductor expand`, to see the current phase's tasks.
 - **Welcome-back card**: in a new session, a line such as "12/20 done · blocked: T13 · next up: T14" with **run** and **dismiss** buttons.
-- **Bars** are SVG in the desktop app and text in the terminal (`━━━●━━╸◉───○`). Colours follow your theme.
+- **Bars** are SVG in the desktop app and text in the terminal (`━━━●━━╸◉───○`). Work in progress is blue and finished work green; in the terminal the colours follow your theme.
 - **Progress report** (`/conductor report`) writes `.knowledge/report.md` and `report.html` from saved data. It makes no model calls.
 
 ## Autonomy levels (`/conductor autonomy <level>` or the pane picker)

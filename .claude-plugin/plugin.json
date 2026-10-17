@@ -139,13 +139,13 @@
     "dailyBudgetUsd": {
       "type": "number",
       "title": "Daily budget (USD)",
-      "description": "Across sessions, in API-equivalent dollars. Near it the conductor wraps up: no new tasks, running agents finish. Models are never changed for it. 0 turns it off.",
+      "description": "Across sessions, in API-equivalent dollars. A plan task, check or upkeep starts only when its estimated cost fits in what is left; running agents always finish. Models are never changed for it. 0 turns it off.",
       "default": 0
     },
     "budgetWrapUpPercent": {
       "type": "number",
       "title": "Wrap up at (% of budget)",
-      "description": "When today's spend reaches this share of the daily budget, the conductor starts wrapping up.",
+      "description": "When today's spend reaches this share of the daily budget, the main agent is told to wrap up its own work.",
       "default": 90
     },
     "sound": {
